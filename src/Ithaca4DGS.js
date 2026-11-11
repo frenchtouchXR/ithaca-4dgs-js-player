@@ -95,7 +95,8 @@ export class Ithaca4DGS extends THREE.Object3D {
     };
     this._sorter.onmessage = ({ data }) => this._onSorted(data);
 
-    if (src) this.load(src, { frames, format }).catch((error) => this._fail(error));
+    // a load cancelled by dispose() (AbortError) is not an error of the video
+    if (src) this.load(src, { frames, format }).catch((error) => { if (error?.name !== "AbortError") this._fail(error); });
   }
 
   get duration() { return (this._range[1] - this._range[0]) / this.fps; }
@@ -384,7 +385,12 @@ export class Ithaca4DGS extends THREE.Object3D {
         // clock: the sound track when it is playing (audio never re-seeked, the video follows it and skips frames on
         // a slow device instead of drifting); otherwise the frame time
         const s = this._sound, el = s && s.el;
-        if (el && !el.paused && !el.seeking && el.readyState >= 2 && !s.blocked) this._time = el.currentTime - s.offset;
+        // only a sound really heard is the clock: spatial sound (THREE.AudioListener) whose AudioContext is still
+        // suspended (no user gesture yet) keeps the element "playing" at a frozen time; the frame clock runs meanwhile
+        // and the sound is re-synced as soon as the context runs
+        const audible = !(s && s.node) || s.node.context.state === "running";
+        if (s && audible !== s.audible) { s.audible = audible; if (audible) this._syncSound(true); }
+        if (el && audible && !el.paused && !el.seeking && el.readyState >= 2 && !s.blocked) this._time = el.currentTime - s.offset;
         else this._time += dt;
         const t0 = this._range[0] / this.fps, t1 = this._range[1] / this.fps;
         if (this._time >= t1) {

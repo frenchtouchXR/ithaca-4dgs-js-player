@@ -42,7 +42,7 @@
 { "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
-    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.1.1/src/index.js" } }
+    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.1.2/src/index.js" } }
 </script>
 </head>
 <body>
@@ -102,14 +102,19 @@ function open(src, title = "") {
   if (video) { scene.remove(video); video.dispose(); }
   status.textContent = "Loading…";
   $("title").textContent = title;
-  video = new Ithaca4DGS({ src, loop: true, autoplay: true, listener });
-  video.position.set(0, 0, -1.5);
-  scene.add(video);
-  video.addEventListener("ready", () => {
+  const v = video = new Ithaca4DGS({ src, loop: true, autoplay: true, listener });
+  v.position.set(0, 0, -1.5);
+  scene.add(v);
+  // events of a video replaced in the meantime (its loading was cancelled) are ignored
+  v.addEventListener("ready", () => {
+    if (v !== video) return;
     status.textContent = "";
-    if (!renderer.xr.isPresenting) controls.fit(video.boundingSphere());
+    if (!renderer.xr.isPresenting) controls.fit(v.boundingSphere());
   });
-  video.addEventListener("error", (e) => { status.textContent = "Error: " + e.error.message; });
+  v.addEventListener("error", (e) => {
+    if (v !== video || e.error?.name === "AbortError") return;
+    status.textContent = "Error: " + e.error.message;
+  });
   document.querySelectorAll(".card").forEach((c, i) => c.setAttribute("aria-current", String(i === current)));
 }
 const openAt = (i) => { current = (i + videos.length) % videos.length; const v = videos[current]; open(v.token, v.title); };
