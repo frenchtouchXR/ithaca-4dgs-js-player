@@ -32,12 +32,14 @@ export const is4dgs = (src) => /\.4dgs($|[?#])/i.test(String((src && src.name) |
 export async function open4dgs(url, { signal, fetchFn } = {}) {
   let q = await fetchRange(url, -PROBE, null, { signal, fetchFn });
   let b = q.bytes;
-  const size = q.whole ? b.length : q.total || b.length;
-  let base = size - b.length;
   if (b.length < TAIL || ascii(b, b.length - 8, 8) !== MAGIC) throw new Error(".4dgs: end signature missing");
   const v = new DataView(b.buffer, b.byteOffset, b.byteLength), k = b.length - TAIL;
   const at = Number(v.getBigUint64(k, true)), len = v.getUint32(k + 8, true);
-  if (at + len !== size - TAIL) throw new Error(".4dgs: inconsistent index position");
+  // file size: told by the server (Content-Range), or else deduced from the tail itself (the index ends TAIL bytes
+  // before the end of the file) when the page may not read Content-Range (CORS rule exposing no header)
+  const size = q.whole ? b.length : q.total || at + len + TAIL;
+  let base = size - b.length;
+  if (at + len !== size - TAIL || base < 0) throw new Error(".4dgs: inconsistent index position");
   if (at < base) {                                       // index longer than the probe: fetched on its own
     q = await fetchRange(url, at, at + len - 1, { signal, fetchFn });
     b = q.bytes; base = at;

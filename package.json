@@ -1,6 +1,6 @@
 {
   "name": "ithaca-4dgs-js-player",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ITHACA 4D Gaussian Splatting videos (.4dgs, .ftgsz) as three.js / A-Frame objects for WebXR scenes and metaverses",
   "type": "module",
   "main": "src/index.js",
