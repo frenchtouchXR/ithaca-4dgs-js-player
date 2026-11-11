@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Sequence switches probe</title>
+<style>html,body{margin:0;height:100%;background:#202124;overflow:hidden}</style>
+<script type="importmap">{ "imports": { "three": "../node_modules/three/build/three.module.js" } }</script>
+</head><body>
+<script type="module">
+import * as THREE from "three";
+import { Ithaca4DGS } from "../src/index.js";
+const q = new URLSearchParams(location.search), SECONDS = Number(q.get("s") || 10);
+const renderer = new THREE.WebGLRenderer(); renderer.setPixelRatio(1); renderer.setSize(1280, 720);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(50, 16 / 9, 0.05, 100);
+camera.position.set(0, 1.2, 2.4); camera.lookAt(0, 0.9, 0);
+const listener = new THREE.AudioListener(); camera.add(listener); scene.add(camera);
+const video = new Ithaca4DGS({ src: q.get("src"), loop: true, autoplay: true, listener: q.get("son") ? listener : null });
+scene.add(video);
+const log = [], evts = [];
+for (const t of ["ready", "waiting", "playing"]) video.addEventListener(t, () => evts.push([t, +performance.now().toFixed(1), +video.currentTime.toFixed(3)]));
+let last = 0, t0 = 0;
+const gl = renderer.getContext(), zone = new Uint8Array(320 * 240 * 4);
+const affiches = () => { gl.readPixels(480, 240, 320, 240, gl.RGBA, gl.UNSIGNED_BYTE, zone); let n = 0; for (let i = 0; i < zone.length; i += 4) if (zone[i] + zone[i + 1] + zone[i + 2] > 60) n++; return n; };
+renderer.setAnimationLoop((now) => {
+  if (q.get("fix")) { video.pause(); video.currentTime = Number(q.get("fix")); }
+  renderer.render(scene, camera);
+  if (video.ready) {
+    if (!t0) t0 = now;
+    log.push([+(now - t0).toFixed(1), +(now - last).toFixed(1), +video.currentTime.toFixed(3), video._active,
+              video.mesh.geometry.instanceCount, +video.stats.mainMs.toFixed(2), affiches(), +video.mesh.material.uniforms.uTime.value.toFixed(6), +video.mesh.material.uniforms.uShScale.value.toFixed(3), video.mesh.material.uniforms.uA.value && video.mesh.material.uniforms.uA.value.id, video.mesh.geometry.id, video._sound ? +(video._sound.el.currentTime - video._sound.offset - video._time).toFixed(4) : null, video._sound ? video._sound.el.paused : null]);
+    if (now - t0 > SECONDS * 1000 && !window.__fini) {
+      window.__fini = true;
+      fetch("/resultat?nom=" + (q.get("nom") || "sauts"), { method: "POST", body: JSON.stringify({ evts, log }) });
+    }
+  }
+  last = now;
+});
+</script></body></html>

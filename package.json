@@ -1,0 +1,16 @@
+{
+  "name": "ithaca-4dgs-js-player",
+  "version": "0.1.0",
+  "description": "ITHACA 4D Gaussian Splatting videos (.4dgs, .ftgsz) as three.js / A-Frame objects for WebXR scenes and metaverses",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": { ".": "./src/index.js", "./aframe": "./src/aframe.js" },
+  "files": ["src", "LICENSE", "README.md"],
+  "peerDependencies": { "three": ">=0.160.0" },
+  "devDependencies": { "three": "0.170.0" },
+  "keywords": ["gaussian-splatting", "4dgs", "webxr", "three.js", "a-frame", "volumetric-video", "metaverse"],
+  "license": "MIT",
+  "author": "French Touch Factory / ITHACA",
+  "scripts": { "serve": "python3 tools/serve.py 8770", "test": "python3 test/render.py data/coucou.4dgs" }
+}

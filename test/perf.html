@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Ithaca4DGS perf</title>
+<style>html,body{margin:0;height:100%;background:#202124;overflow:hidden}canvas{display:block}</style>
+<script type="importmap">{ "imports": { "three": "../node_modules/three/build/three.module.js" } }</script>
+</head><body>
+<script type="module">
+const erreurs = [];
+const ce = console.error.bind(console), cw = console.warn.bind(console);
+console.error = (...a) => { erreurs.push("E " + a.map(String).join(" ").slice(0, 4000)); ce(...a); };
+console.warn = (...a) => { erreurs.push("W " + a.map(String).join(" ").slice(0, 1500)); cw(...a); };
+addEventListener("error", (e) => erreurs.push("X " + e.message));
+import * as THREE from "three";
+if (new URLSearchParams(location.search).get("seules")) window.__seules = new URLSearchParams(location.search).get("seules").split(",").map(Number);
+import { Ithaca4DGS, TurntableControls } from "../src/index.js";
+const q = new URLSearchParams(location.search);
+const W = Number(q.get("w") || 1920), H = Number(q.get("h") || 1080), SECONDS = Number(q.get("s") || 8);
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+document.body.appendChild(renderer.domElement);
+const gl = renderer.getContext(), dbg = gl.getExtension("WEBGL_debug_renderer_info");
+const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, W / H, 0.05, 100);
+camera.position.fromArray((q.get("cam") || "0,1.1,2.6").split(",").map(Number));
+camera.lookAt(0, Number(q.get("look") || 0.85), 0);
+const video = new Ithaca4DGS({ src: q.get("src"), loop: true, autoplay: !q.get("fix") });   // fixed time: no autoplay
+scene.add(video);
+window.__video = video; window.__camera = camera;
+let controls = null;
+if (q.get("fit")) { controls = new TurntableControls(camera, renderer.domElement);
+  video.addEventListener("ready", () => { controls.fit(video.boundingSphere()); controls.yaw = Number(q.get("yaw") || 0.45); controls.update(); }); }
+if (q.get("fix")) video.addEventListener("ready", () => { video.pause(); video.currentTime = Number(q.get("fix")); });
+let t0 = 0, last = 0, mesure = false;
+const frames = [], main = [], sorts = [], couts = [];
+const px = new Uint8Array(4);
+function couverture(gl) {                    // share of the screen covered by the model (pixels ≠ the corner pixel)
+  const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, p = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, p);
+  let n = 0;
+  for (let i = 0; i < p.length; i += 4)
+    if (Math.abs(p[i] - p[0]) + Math.abs(p[i + 1] - p[1]) + Math.abs(p[i + 2] - p[2]) > 24) n++;
+  let mx = 0; for (let i = 0; i < p.length; i += 4) mx = Math.max(mx, p[i], p[i + 1], p[i + 2]);
+  window.__diag = { w, h, mx, coin: [p[0], p[1], p[2], p[3]] };
+  if (q.get("image")) {                      // image of the frame (flipped: GL rows are bottom-up)
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const c2 = cv.getContext("2d"), img = c2.createImageData(w, h);
+    for (let y = 0; y < h; y++) img.data.set(p.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    c2.putImageData(img, 0, 0);
+    window.__image = cv.toDataURL("image/png");
+  }
+  return +(100 * n / (w * h)).toFixed(1);
+}
+let couvre = null, demande = false;
+const fin = (r) => { window.__perf = r; fetch("/resultat?nom=" + (q.get("nom") || "perf"), { method: "POST", body: JSON.stringify(r) }).catch(() => {}); };
+video.addEventListener("error", (e) => fin({ erreur: e.error.message, gpu }));
+video.addEventListener("ready", () => {
+  const debut = performance.now();
+  setTimeout(() => { mesure = true; t0 = performance.now(); }, 1500);       // after warm-up
+  setTimeout(() => { demande = true; }, 1500 + SECONDS * 1000 - 300);
+  setTimeout(() => {
+    mesure = false;
+    const dur = (performance.now() - t0) / 1000, s = [...frames].sort((a, b) => a - b);
+    const p = (x) => s[Math.min(s.length - 1, Math.floor(x * s.length))];
+    const moy = (a) => a.reduce((x, y) => x + y, 0) / Math.max(a.length, 1);
+    fin({ gpu, resolution: `${W}x${H}`, ecran_couvert_pct: couvre, diag: window.__diag, erreurs: erreurs.slice(0, 12), etat_gl: window.__gl, instances: video.mesh.geometry.instanceCount, attr: Array.from((video.mesh.geometry.attributes.splatIndex || {array: []}).array.slice(0, 6)), maxInst: video.mesh.geometry._maxInstanceCount, image: window.__image || null, gl_erreur: gl.getError(), gaussiennes: video.stats.gaussians, visibles: video.stats.visible,
+          images_par_s: +(frames.length / dur).toFixed(1), image_ms_moy: +moy(frames).toFixed(2),
+          image_ms_p95: +p(0.95).toFixed(2), image_ms_max: +s[s.length - 1].toFixed(2),
+          // cost of one frame, GPU work included (render + readPixels sync): the real ceiling of the frame rate
+          cout_image_ms_moy: +moy(couts).toFixed(2), cout_image_ms_p95: +[...couts].sort((a, b) => a - b)[Math.floor(0.95 * couts.length)].toFixed(2),
+          images_par_s_max: +(1000 / moy(couts)).toFixed(0),
+          fil_principal_ms_moy: +moy(main).toFixed(3), fil_principal_ms_max: +Math.max(...main).toFixed(3),
+          tri_ms_moy: +moy(sorts).toFixed(2), tris_par_s: +video.stats.sortsPerSecond.toFixed(1),
+          telechargement_ms: +video.stats.fetchMs.toFixed(0), decodage_ms: +video.stats.decodeMs.toFixed(0),
+          preparation_ms: +video.stats.packMs.toFixed(0), pret_apres_ms: +(debut - performance.timeOrigin + performance.timeOrigin).toFixed(0) });
+  }, 1500 + SECONDS * 1000);
+});
+renderer.setAnimationLoop((now) => {
+  const c0 = performance.now();
+  if (controls) controls.update();
+  renderer.render(scene, camera);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);     // waits for the GPU to finish this frame
+  const cout = performance.now() - c0;
+  if (window.__seules && !window.__fini && video.ready && performance.now() - t0 > 3000) {
+    // diagnostic : quelques taches seules, une à une, pixel relevé (après rendu complet)
+    window.__fini = true; video._sorting = true;                  // plus de tri : l'ordre imposé reste
+    const g = video.mesh.geometry, attr = g.attributes.splatIndex, res = [];
+    for (const k of window.__seules) {
+      attr.array[0] = k; attr.clearUpdateRanges(); attr.addUpdateRange(0, 1); attr.needsUpdate = true; g.instanceCount = 1;
+      renderer.render(scene, camera);
+      const px2 = new Uint8Array(4); gl.readPixels(Number(q.get("px")), H - 1 - Number(q.get("py")), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px2);
+      res.push({ k, rgb: Array.from(px2.slice(0, 3)) });
+    }
+    fetch("/resultat?nom=" + q.get("nom"), { method: "POST", body: JSON.stringify({ seules: res }) });
+  }
+  if (demande) {
+    couvre = couverture(gl); demande = false;
+    const pr = renderer.info.programs.find((x) => x.name === "ShaderMaterial" || /Shader/.test(x.name)) || renderer.info.programs[renderer.info.programs.length - 1];
+    const prog = pr && pr.program, loc = prog ? gl.getAttribLocation(prog, "splatIndex") : -2, locP = prog ? gl.getAttribLocation(prog, "position") : -2;
+    const vao = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+    window.__gl = { programmes: renderer.info.programs.map((x) => x.name), loc, locP, vao: !!vao,
+      actif: loc >= 0 ? gl.getVertexAttrib(loc, gl.VERTEX_ATTRIB_ARRAY_ENABLED) : null,
+      diviseur: loc >= 0 ? gl.getVertexAttrib(loc, gl.VERTEX_ATTRIB_ARRAY_DIVISOR) : null,
+      tampon: loc >= 0 && gl.getVertexAttrib(loc, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING) ? "oui" : "non",
+      type: loc >= 0 ? gl.getVertexAttrib(loc, gl.VERTEX_ATTRIB_ARRAY_TYPE) : null };
+  }
+  if (mesure) { frames.push(now - last); main.push(video.stats.mainMs); sorts.push(video.stats.sortMs); couts.push(cout); }
+  last = now;
+});
+</script></body></html>

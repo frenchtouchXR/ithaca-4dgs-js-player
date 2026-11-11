@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Ithaca4DGS test</title>
+<style>html,body{margin:0;height:100%;background:#202124;overflow:hidden}canvas{display:block}</style>
+<script type="importmap">{ "imports": { "three": "../node_modules/three/build/three.module.js" } }</script>
+</head><body>
+<script type="module">
+import * as THREE from "three";
+import { Ithaca4DGS } from "../src/index.js";
+const q = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202124);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+camera.position.fromArray((q.get("cam") || "0,1.1,2.6").split(",").map(Number));
+camera.lookAt(0, Number(q.get("look") || 0.85), 0);
+scene.add(new THREE.GridHelper(4, 8, 0x888888, 0x444444));
+const cube = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshNormalMaterial());
+cube.position.set(0.55, 0.15, 0.3);                        // an opaque object in front: occlusion test
+scene.add(cube);
+// blob=1: the file is fetched first and given as a local File (as from a file picker or a drop)
+let src = q.get("src");
+if (q.get("blob") === "1") src = new File([await (await fetch(src)).blob()], src.split("/").pop());
+const video = new Ithaca4DGS({ src, loop: true, autoplay: q.get("play") !== "0", frames: Number(q.get("frames")) || null });
+scene.add(video);
+window.__etat = "load";
+window.__video = video;
+video.addEventListener("ready", () => { window.__etat = "ready"; });
+video.addEventListener("error", (e) => { window.__etat = "error: " + e.error.message; });
+let frames = 0, t0 = 0;
+window.__fps = () => { const r = frames / ((performance.now() - t0) / 1000); frames = 0; t0 = performance.now(); return r; };
+renderer.setAnimationLoop(() => {
+  if (q.get("time")) video.currentTime = Number(q.get("time"));
+  renderer.render(scene, camera);
+  frames++;
+});
+</script></body></html>

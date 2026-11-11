@@ -1,0 +1,29 @@
+<!doctype html><html><head><meta charset="utf-8">
+<script type="importmap">{ "imports": { "three": "../node_modules/three/build/three.module.js" } }</script></head><body style="margin:0">
+<script type="module">
+import * as THREE from "three";
+const q = new URLSearchParams(location.search), mode = q.get("mode");    // "avant" | "apres"
+const r = new THREE.WebGLRenderer(); r.setSize(400, 400); document.body.appendChild(r.domElement);
+const scene = new THREE.Scene(), cam = new THREE.Camera();
+const g = new THREE.InstancedBufferGeometry();
+g.setAttribute("position", new THREE.BufferAttribute(new Float32Array([-1,-1,0, 1,-1,0, 1,1,0, -1,1,0]), 3));
+g.setIndex([0, 1, 2, 0, 2, 3]);
+const N = 400;
+const attr = () => { const a = new THREE.InstancedBufferAttribute(new Float32Array(N).map((_, i) => i), 1); a.setUsage(THREE.DynamicDrawUsage); return a; };
+if (mode === "avant") g.setAttribute("splatIndex", attr());
+g.instanceCount = mode === "avant" ? N : 0;
+const m = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3,
+  vertexShader: `in float splatIndex; void main(){ float i = splatIndex; vec2 c = vec2(mod(i, 20.0), floor(i / 20.0)) / 10.0 - 0.95; gl_Position = vec4(c + position.xy * 0.03, 0.0, 1.0); }`,
+  fragmentShader: `layout(location = 0) out highp vec4 o; void main(){ o = vec4(1.0, 0.0, 0.0, 1.0); }` });
+const mesh = new THREE.Mesh(g, m); mesh.frustumCulled = false; scene.add(mesh);
+let f = 0;
+r.setAnimationLoop(() => {
+  if (mode === "apres" && f === 3) { g.setAttribute("splatIndex", attr()); g.instanceCount = N; }
+  r.render(scene, cam); f++;
+  if (f === 10) {
+    const gl = r.getContext(), p = new Uint8Array(400 * 400 * 4); gl.readPixels(0, 0, 400, 400, gl.RGBA, gl.UNSIGNED_BYTE, p);
+    let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i] > 128) n++;
+    fetch("/resultat?nom=inst_" + mode, { method: "POST", body: JSON.stringify({ mode, rouge_pct: +(100 * n / 160000).toFixed(1) }) });
+  }
+});
+</script></body></html>

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ithaca 4DGS JS player (WebGL2)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16171a; overflow: hidden; font: 14px/1.4 system-ui, sans-serif; color: #e8e8ea; }
+  canvas { display: block; }
+  #panel { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 10px; align-items: center;
+           background: rgba(20, 21, 24, 0.82); padding: 10px 14px; border-radius: 10px; }
+  button { background: #2b2d33; color: #e8e8ea; border: 1px solid #3c3f46; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  button:hover { background: #363941; }
+  #time { width: 260px; }
+  #stats { position: fixed; right: 16px; top: 16px; background: rgba(20, 21, 24, 0.82); padding: 8px 12px;
+           border-radius: 8px; font: 12px/1.5 ui-monospace, monospace; white-space: pre; }
+  #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); opacity: 0.8; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "../node_modules/three/build/three.module.js",
+               "three/addons/": "../node_modules/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="status">Loading…</div>
+<div id="panel">
+  <button id="play">Pause</button>
+  <button id="sound" title="Sound (spatial: it comes from the video)">Sound off</button>
+  <input id="time" type="range" min="0" max="1" step="0.001" value="0">
+  <span id="clock">0.0 s</span>
+</div>
+<div id="stats"></div>
+<script type="module">
+import * as THREE from "three";
+import { VRButton } from "three/addons/webxr/VRButton.js";
+import { ARButton } from "three/addons/webxr/ARButton.js";
+import { Ithaca4DGS, TurntableControls } from "../src/index.js";
+
+const src = new URLSearchParams(location.search).get("src") || "../test/data/coucou.4dgs";
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+const ar = ARButton.createButton(renderer, { optionalFeatures: ["local-floor"] });
+ar.style.left = "calc(50% + 90px)";
+document.body.appendChild(ar);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x16171a);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.25, 2.6);
+// turntable manipulator (left drag orbit, right / middle / Shift drag pan, wheel zoom, W A S D Q E fly)
+const controls = new TurntableControls(camera, renderer.domElement);
+controls.fit({ center: new THREE.Vector3(0, 0.85, 0), radius: 1 });
+
+// a small "metaverse" room: floor grid and a few opaque objects around the video
+scene.add(new THREE.GridHelper(8, 16, 0x5a5d66, 0x2e3036));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 2.5));
+const mat = new THREE.MeshStandardMaterial({ color: 0x4a6fa5, roughness: 0.6 });
+const box = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), mat);
+box.position.set(1.1, 0.2, 0.4);
+scene.add(box);
+const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 2, 24), new THREE.MeshStandardMaterial({ color: 0xa5734a }));
+pillar.position.set(-1.2, 1, -0.6);
+scene.add(pillar);
+
+// spatial sound: a listener on the camera; the video carries its own positional source
+const listener = new THREE.AudioListener();
+camera.add(listener);
+scene.add(camera);
+
+// the 4D video, an ordinary object of the scene
+const video = new Ithaca4DGS({ src, loop: true, autoplay: true, listener });
+window.video = video;                       // handy in the browser console
+scene.add(video);
+
+const status = document.getElementById("status"), play = document.getElementById("play");
+const slider = document.getElementById("time"), clock = document.getElementById("clock"), stats = document.getElementById("stats");
+video.addEventListener("ready", () => { status.remove(); controls.fit(video.boundingSphere()); });
+video.addEventListener("error", (e) => { status.textContent = "Error: " + e.error.message; });
+play.onclick = () => { video.playing ? video.pause() : video.play(); };
+// browsers keep audio off until a user gesture: this button turns it on (and off)
+const sound = document.getElementById("sound");
+sound.onclick = async () => {
+  const on = sound.textContent === "Sound off";
+  if (on) { await listener.context.resume(); listener.setMasterVolume(1); if (video.playing) video.play(); }
+  else listener.setMasterVolume(0);
+  sound.textContent = on ? "Sound on" : "Sound off";
+};
+listener.setMasterVolume(0);
+let dragging = false;
+slider.oninput = () => { dragging = true; video.currentTime = Number(slider.value) * video.duration; };
+slider.onchange = () => { dragging = false; };
+
+let frames = 0, last = performance.now(), fps = 0;
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+  frames++;
+  const now = performance.now();
+  if (now - last > 500) { fps = (frames * 1000) / (now - last); frames = 0; last = now; }
+  play.textContent = video.playing ? "Pause" : "Play";
+  if (video.duration) {
+    if (!dragging) slider.value = video.currentTime / video.duration;
+    clock.textContent = `${video.currentTime.toFixed(1)} / ${video.duration.toFixed(1)} s`;
+  }
+  const s = video.stats;
+  stats.textContent = `${fps.toFixed(0)} fps\n${s.visible.toLocaleString("en")} / ${s.gaussians.toLocaleString("en")} gaussians\n` +
+                      `sort ${s.sortMs.toFixed(1)} ms (worker)\nmain thread ${s.mainMs.toFixed(2)} ms`;
+});
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
