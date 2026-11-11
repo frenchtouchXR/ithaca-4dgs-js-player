@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ITHACA 4DGS in WebXR</title>
+<link rel="icon" href="data:,">
+<!-- Demo of the Ithaca 4DGS JS player (MIT): the ITHACA Featured 4DGS videos as objects of a WebXR scene (VR / AR,
+     Meta Quest browser included). Loads the published package from a CDN; ?src=<share link, token or .4dgs URL>. -->
+<style>
+  :root { --bg: #111317; --panel: rgba(22, 24, 28, 0.88); --line: #33363d; --text: #e9e9ec; --muted: #9a9ca3; --accent: #bfd859; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; font: 14px/1.4 system-ui, sans-serif; color: var(--text); }
+  canvas { display: block; }
+  #gallery { position: fixed; left: 16px; top: 16px; bottom: 88px; width: 280px; overflow-y: auto; background: var(--panel);
+             border-radius: 12px; padding: 12px; box-sizing: border-box; }
+  #gallery h1 { font-size: 15px; margin: 0 0 4px; }
+  #gallery p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+  .card { display: flex; gap: 10px; align-items: center; padding: 6px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+  .card:hover { background: #22252b; }
+  .card[aria-current="true"] { border-color: var(--accent); }
+  .card img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; background: #22252b; flex: none; }
+  .card b { display: block; font-weight: 600; font-size: 13px; }
+  .card span { color: var(--muted); font-size: 12px; }
+  #panel { position: fixed; left: 16px; right: 16px; bottom: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           background: var(--panel); padding: 10px 14px; border-radius: 12px; }
+  button { background: #2a2d33; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; cursor: pointer; font: inherit; }
+  button:hover { background: #353940; }
+  #time { flex: 1; min-width: 120px; accent-color: var(--accent); }
+  #title { color: var(--muted); max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status { position: fixed; left: 50%; top: 45%; transform: translate(-50%, -50%); background: var(--panel); padding: 10px 16px;
+            border-radius: 10px; pointer-events: none; }
+  #status:empty { display: none; }
+  /* VR and AR buttons of three.js side by side (their inline position is overridden) */
+  #xr { position: fixed; left: 50%; bottom: 80px; transform: translateX(-50%); display: flex; gap: 12px; }
+  #xr button { position: static !important; left: auto !important; bottom: auto !important; width: auto !important; }
+  @media (max-width: 700px) { #xr { bottom: 320px; } }
+  #drop { position: fixed; inset: 0; border: 3px dashed var(--accent); display: none; align-items: center; justify-content: center;
+          background: rgba(17, 19, 23, 0.7); font-size: 18px; pointer-events: none; }
+  @media (max-width: 700px) { #gallery { top: auto; bottom: 140px; left: 16px; right: 16px; width: auto; height: 170px; } }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.1.0/src/index.js" } }
+</script>
+</head>
+<body>
+<aside id="gallery"><h1>ITHACA Featured 4DGS</h1><p>Pick a 4D video, then enter VR or AR. In the headset: trigger = play / pause, grip = next video.</p><div id="list">Loading the gallery…</div></aside>
+<div id="status"></div>
+<div id="drop">Drop a .4dgs file</div>
+<div id="panel">
+  <button id="play">Pause</button>
+  <button id="sound" title="Spatial sound: it comes from the video">Sound off</button>
+  <input id="time" type="range" min="0" max="1" step="0.001" value="0" aria-label="Time">
+  <span id="clock">0.0 s</span>
+  <span id="title"></span>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { VRButton } from "three/addons/webxr/VRButton.js";
+import { ARButton } from "three/addons/webxr/ARButton.js";
+import { Ithaca4DGS, TurntableControls, listFeatured } from "ithaca-4dgs-js-player";
+
+const $ = (id) => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType("local-floor");          // y = 0 on the real floor in VR and AR
+document.body.appendChild(renderer.domElement);
+const vrButton = VRButton.createButton(renderer);
+const arButton = ARButton.createButton(renderer, { optionalFeatures: ["local-floor"] });
+const xr = document.createElement("div");
+xr.id = "xr";
+xr.append(vrButton, arButton);
+document.body.append(xr);
+
+const scene = new THREE.Scene();
+const background = new THREE.Color(0x111317);
+scene.background = background;
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.4, 1.2);
+const controls = new TurntableControls(camera, renderer.domElement);
+
+// the room (VR and screen only: hidden in AR, where the real room is seen)
+const room = new THREE.Group();
+room.add(new THREE.GridHelper(10, 20, 0x5a5d66, 0x2a2c32));
+room.add(new THREE.HemisphereLight(0xffffff, 0x404050, 2.5));
+scene.add(room);
+
+const listener = new THREE.AudioListener();
+camera.add(listener);
+scene.add(camera);
+listener.setMasterVolume(0);                               // browsers: sound only after a user gesture
+
+let video = null, videos = [], current = -1;
+const status = $("status");
+
+/** Opens a video (share token or link, .4dgs URL, local File) 1.5 m in front of the user, on the floor. */
+function open(src, title = "") {
+  if (video) { scene.remove(video); video.dispose(); }
+  status.textContent = "Loading…";
+  $("title").textContent = title;
+  video = new Ithaca4DGS({ src, loop: true, autoplay: true, listener });
+  video.position.set(0, 0, -1.5);
+  scene.add(video);
+  video.addEventListener("ready", () => {
+    status.textContent = "";
+    if (!renderer.xr.isPresenting) controls.fit(video.boundingSphere());
+  });
+  video.addEventListener("error", (e) => { status.textContent = "Error: " + e.error.message; });
+  document.querySelectorAll(".card").forEach((c, i) => c.setAttribute("aria-current", String(i === current)));
+}
+const openAt = (i) => { current = (i + videos.length) % videos.length; const v = videos[current]; open(v.token, v.title); };
+
+// gallery: the ITHACA Featured 4DGS videos made for headsets
+try {
+  const f = await listFeatured({ sort: "popular", perPage: 50, headset: true });
+  videos = f.videos;
+  $("list").replaceChildren(...videos.map((v, i) => {
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = `<img alt="" loading="lazy"><div><b></b><span></span></div>`;
+    c.querySelector("img").src = v.thumbnail;
+    c.querySelector("b").textContent = v.title;
+    c.querySelector("span").textContent = `${v.creator}${v.duration ? " · " + v.duration.toFixed(0) + " s" : ""}`;
+    c.onclick = () => openAt(i);
+    return c;
+  }));
+} catch (e) {
+  $("list").textContent = "Gallery unavailable: " + e.message;
+}
+const asked = new URLSearchParams(location.search).get("src");
+if (asked) open(asked, "");
+else if (videos.length) openAt(0);
+
+// headset controllers: trigger = play / pause, grip = next video
+for (const k of [0, 1]) {
+  const c = renderer.xr.getController(k);
+  c.addEventListener("select", () => { if (video) video.playing ? video.pause() : video.play(); });
+  c.addEventListener("squeeze", () => { if (videos.length) openAt(current + 1); });
+  scene.add(c);
+}
+// AR: no background nor room, the video stands in the real room
+renderer.xr.addEventListener("sessionstart", async () => {
+  await listener.context.resume(); listener.setMasterVolume(1); $("sound").textContent = "Sound on";
+  const ar = renderer.xr.getSession().environmentBlendMode !== "opaque";
+  scene.background = ar ? null : background;
+  room.visible = !ar;
+});
+renderer.xr.addEventListener("sessionend", () => { scene.background = background; room.visible = true; });
+
+// screen controls
+$("play").onclick = () => { if (video) video.playing ? video.pause() : video.play(); };
+$("sound").onclick = async () => {
+  const on = $("sound").textContent === "Sound off";
+  if (on) { await listener.context.resume(); listener.setMasterVolume(1); if (video && video.playing) video.play(); }
+  else listener.setMasterVolume(0);
+  $("sound").textContent = on ? "Sound on" : "Sound off";
+};
+let dragging = false;
+$("time").oninput = () => { dragging = true; if (video && video.duration) video.currentTime = Number($("time").value) * video.duration; };
+$("time").onchange = () => { dragging = false; };
+
+// a local .4dgs dropped on the page
+addEventListener("dragover", (e) => { e.preventDefault(); $("drop").style.display = "flex"; });
+addEventListener("dragleave", () => { $("drop").style.display = "none"; });
+addEventListener("drop", (e) => {
+  e.preventDefault(); $("drop").style.display = "none";
+  const f = e.dataTransfer.files[0];
+  if (f) { current = -1; open(f, f.name); }
+});
+
+renderer.setAnimationLoop(() => {
+  if (!renderer.xr.isPresenting) controls.update();
+  renderer.render(scene, camera);
+  if (video) {
+    $("play").textContent = video.playing ? "Pause" : "Play";
+    if (video.duration) {
+      if (!dragging) $("time").value = video.currentTime / video.duration;
+      $("clock").textContent = `${video.currentTime.toFixed(1)} / ${video.duration.toFixed(1)} s`;
+    }
+  }
+});
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
