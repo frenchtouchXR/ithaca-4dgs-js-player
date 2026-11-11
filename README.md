@@ -35,8 +35,6 @@ same `three` module (one copy), as for any three.js add-on.
 
 ```sh
 npm install three ithaca-4dgs-js-player
-# until it is published on npm:
-npm install three github:frenchtouchXR/ithaca-4dgs-js-player
 ```
 
 The two Web Workers of the player are written as `new Worker(new URL(…, import.meta.url))`: Vite and webpack 5 find
@@ -51,7 +49,7 @@ from your own server:
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
-    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/gh/frenchtouchXR/ithaca-4dgs-js-player@main/src/index.js"
+    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.1.0/src/index.js"
   }
 }
 </script>
