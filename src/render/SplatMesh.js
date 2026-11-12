@@ -3,7 +3,7 @@
 //
 // Renderer of one 4DGS sequence at a time, behind a small interface so that it can be swapped for another splat
 // engine later:   setData(packed) → handle ; useData(handle) ; setOrder(handle, order, visible) ; setTime(t) ;
-//                 setFade(opacity, window) ; setBox(mode, center, half, toScene) ; disposeData(handle) ; dispose()
+//                 setFade(opacity) ; setBox(mode, center, half, toScene) ; disposeData(handle) ; dispose()
 import * as THREE from "three";
 import { vertexShader, fragmentShader } from "./shaders.js";
 
@@ -47,7 +47,7 @@ export class SplatMesh extends THREE.Mesh {
         uTime: { value: 0 }, uShScale: { value: 0 }, uViewport: { value: new THREE.Vector2(1, 1) },
         uCamPos: { value: new THREE.Vector3() }, uBoxMode: { value: 0 }, uToScene: { value: new THREE.Matrix4() },
         uBoxCenter: { value: new THREE.Vector3() }, uBoxHalf: { value: new THREE.Vector3(1, 1, 1) }, uMaxAxis: { value: 1e6 },   // no cap on the splat size (as the reference gaussian rasterizers)
-        uOpacity: { value: 1 }, uWinOn: { value: 0 }, uWin: { value: new THREE.Vector2() },
+        uOpacity: { value: 1 },
       },
     });
     // attribute 0 must be the per-vertex one: ANGLE on Direct3D 11 (Chrome / Edge on Windows) otherwise repeats the
@@ -112,14 +112,8 @@ export class SplatMesh extends THREE.Mesh {
 
   setTime(t) { this.material.uniforms.uTime.value = t; }
 
-  /** Transitions between sequences: opacity weight of the sequence drawn, and its time window [w0, w1) (its
-      training frames) instead of the one stored with each gaussian (its core); window null: the stored one. */
-  setFade(opacity, window) {
-    const u = this.material.uniforms;
-    u.uOpacity.value = opacity;
-    u.uWinOn.value = window ? 1 : 0;
-    if (window) u.uWin.value.set(window[0], window[1]);
-  }
+  /** Transitions between sequences: opacity weight of the sequence drawn (1 outside transitions). */
+  setFade(opacity) { this.material.uniforms.uOpacity.value = opacity; }
 
   raycast() {}                                          // splats are not pickable as a quad mesh
 

@@ -253,7 +253,16 @@ export class Ithaca4DGS extends THREE.Object3D {
         this._time = w.first / this.fps;
       }
       if (this._entries.get(k) !== e) return null;    // evicted meanwhile
-      e.win = this._trainWindow(s);
+      // transitions: the window of every gaussian (its sequence's core) widened to the training frames, in the GPU
+      // texture B (floats z, w) and in the sort data, so that the sequence stays drawn during its transitions
+      const win = this._trainWindow(s);
+      if (win) {
+        const B = packed.textures.B, opa = packed.sort.opa, f = new Float32Array(win), u = new Uint32Array(f.buffer);
+        for (let i = 0; i < packed.count; i++) {
+          B[i * 4 + 2] = u[0]; B[i * 4 + 3] = u[1];
+          opa[i * 3 + 1] = win[0]; opa[i * 3 + 2] = win[1];
+        }
+      }
       if (k === 0 || !this._framed) this._frame(packed.bounds);
       const { pos, vel, opa } = packed.sort;
       this._sorter.postMessage({ type: "add", id: e.id, count: packed.count, pos, vel, opa }, [pos.buffer, vel.buffer, opa.buffer]);
@@ -473,13 +482,13 @@ export class Ithaca4DGS extends THREE.Object3D {
     const both = !!(zone && e && e.state === "ready" && pe && pe.state === "ready" && pe.order);
     const [wPrev, wNext] = zone ? Ithaca4DGS._weights(zone, Math.floor(frame)) : [1, 1];
     const wCur = !both ? 1 : k === zone.a ? wPrev : wNext, wPartner = k === zone?.a ? wNext : wPrev;
-    this.mesh.setFade(wCur, e && e.win);
+    this.mesh.setFade(wCur);
     this.mesh.renderOrder = wCur < 1 ? 1 : 0;           // the fading sequence is drawn over the full one
     this.fadeMesh.visible = both;
     if (both) {
       if (this.fadeMesh.current !== pe.handle) { this.mesh.upload(pe.handle, renderer); this.fadeMesh.useData(pe.handle); }
       this.fadeMesh.setTime(t);
-      this.fadeMesh.setFade(wPartner, pe.win);
+      this.fadeMesh.setFade(wPartner);
       this.fadeMesh.renderOrder = wPartner < 1 ? 1 : 0;
       // sort both sequences in turn, at the current time
       if (!this._sorting) return (this._req & 1) ? this._sort(pe, t, camera, false) : this._sort(e, t, camera, false);
@@ -508,8 +517,7 @@ export class Ithaca4DGS extends THREE.Object3D {
     this._req++;
     // keep what fades in during the next 2 video frames (the order is used for the coming frames)
     const lookahead = this.totalFrames > 1 ? 2 / (this.totalFrames - 1) : 0;
-    this._sorter.postMessage({ type: "sort", id: entry.id, req: this._req, time: t, ahead: lookahead, row: [m[2], m[6], m[10], m[14]],
-                               win: entry.win || null });
+    this._sorter.postMessage({ type: "sort", id: entry.id, req: this._req, time: t, ahead: lookahead, row: [m[2], m[6], m[10], m[14]] });
   }
 
   _onSorted({ id, order, visible, ms }) {
