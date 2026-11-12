@@ -19,6 +19,8 @@ on each video (`.4dgs` or `.ftgsz`, both read by this player), or play them dire
 - HD and Low Quality ITHACA renders
 - Plays while loading: decoding and depth sorting run in Web Workers; the next sequence is fetched, decoded, uploaded
   and pre-sorted before it is needed; the sound is the master clock
+- Transitions: videos rendered with a transition between sequences (ITHACA expert setting) crossfade from one sequence
+  to the next; the others cut as before
 - WebGL 2, three.js ≥ 0.160 (peer dependency), MIT licence, no other dependency
 
 ---
@@ -175,6 +177,7 @@ playing it; `shareToken(url)` extracts the token of a share link; `shareUrl(toke
 | `fps` | `30` | frame rate when the source does not say |
 | `applyFraming` | `true` | apply the framing set on the ITHACA platform (`.4dgs`, share links) |
 | `frames` | `null` | frame count of a lone Low Quality sequence |
+| `crossfade` | `true` | crossfade between sequences in videos rendered with a transition (`false`: hard cut) |
 | `format` | `null` | `"4dgs"`, `"manifest"`, `"ftgsz"` or `"ply"` when the name does not tell (a `Blob`) |
 | `server` | `"https://www.ithaca.eu"` | ITHACA site that resolves share links |
 | `fetchFn` | `fetch` | custom fetch (headers, credentials, signed URLs…) |

@@ -48,7 +48,9 @@ export async function resolveShare(token, { server = ITHACA_SERVER, signal, fetc
     token, title: d.titre || "", fps: Number(d.fps) || 30, frames: Number(d.total) || 0,
     framing: d.cadrage || null, soundOffset: Number(d.decalage_son) || 0, version: d.version || "",
     file,                                                     // single .4dgs file of the video, when there is one
-    sequences: (d.sequences || []).map((s) => ({ url: s.url, format: s.format || "", first: Number(s.premiere) || 0, frames: Number(s.images) || 0 })),
+    sequences: (d.sequences || []).map((s) => ({ url: s.url, format: s.format || "", first: Number(s.premiere) || 0, frames: Number(s.images) || 0,
+                                                 // transition between sequences: frames the sequence was trained on (0: none)
+                                                 trainFirst: Number(s.trainPremiere ?? s.premiere) || 0, trainFrames: Number(s.trainImages) || 0 })),
     sounds: [...(d.sons || []), ...(d.sons_ogg || [])].filter((u) => typeof u === "string"),
     effects: d.effets || null,                                // scene effects of the ITHACA viewer (not rendered here)
     pageUrl: shareUrl(token, server),

@@ -36,7 +36,7 @@ function framingRotation([ax, ay, az]) {
 
 export class Ithaca4DGS extends THREE.Object3D {
   constructor({ src, autoplay = true, loop = true, listener = null, fps = 30, applyFraming = true, fetchFn,
-                server = ITHACA_SERVER, frames = null, format = null } = {}) {
+                server = ITHACA_SERVER, frames = null, format = null, crossfade = true } = {}) {
     super();
     this.server = server;               // ITHACA site that resolves share links
     this.share = null;                  // description of the ITHACA share being played (share links only)
@@ -46,6 +46,8 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.autoplay = autoplay;
     this.listener = listener;
     this.applyFraming = applyFraming;
+    this.crossfade = crossfade;         // transitions between sequences (videos rendered with them): crossfade, else cut
+    this._zones = [];
     this.fps = fps;
     this.index = null;
     this.sequences = [];
@@ -80,6 +82,10 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.mesh = new SplatMesh();
     this.mesh.onRender = (renderer, camera) => this._onRender(renderer, camera);
     this.framing.add(this.mesh);
+    // second sequence drawn during a transition (crossfade), on top of the other when it is the fading one
+    this.fadeMesh = new SplatMesh();
+    this.fadeMesh.visible = false;
+    this.framing.add(this.fadeMesh);
 
     // literal new Worker(new URL(…, import.meta.url)) forms: bundlers (Vite, webpack 5) bundle the workers from them
     const dec = new URL("./workers/decode.worker.js", import.meta.url), srt = new URL("./workers/sort.worker.js", import.meta.url);
@@ -139,12 +145,14 @@ export class Ithaca4DGS extends THREE.Object3D {
       this.totalFrames = Number(m.n_frames) || m.segments.reduce((a, x) => Math.max(a, x.first_frame + x.n_frames), 0);
       this._range = [first, first + this.totalFrames];
       this.index = { manifest: m };
-      this.sequences = m.segments.map((x) => ({ first: x.first_frame, frames: x.n_frames, url: new URL(x.file, base).href, range: null }));
+      this.sequences = m.segments.map((x) => ({ first: x.first_frame, frames: x.n_frames, url: new URL(x.file, base).href, range: null,
+                                                trainFirst: x.train_first_frame ?? x.first_frame, trainFrames: x.train_n_frames || 0 }));
     } else {
       // single sequence; a lone Low Quality sequence needs its frame count (HD sequences carry it in their header)
       this.sequences = [{ first: frames ? 0 : null, frames: frames || null, url: src, range: null }];
       if (frames) { this.totalFrames = frames; this._range = [0, frames]; }
     }
+    this._setupZones();
     this.dispatchEvent({ type: "load", index: this.index });
     await this._ensure(0);
   }
@@ -155,7 +163,8 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.fps = index.fps || this.fps;
     this.totalFrames = index.images;
     this._range = [0, index.images];
-    this.sequences = index.sequences.map((s) => ({ first: s.premiere, frames: s.images, url: src, range: [s.offset, s.octets] }));
+    this.sequences = index.sequences.map((s) => ({ first: s.premiere, frames: s.images, url: src, range: [s.offset, s.octets],
+                                                   trainFirst: s.entrainement_premiere ?? s.premiere, trainFrames: s.entrainement_images || 0 }));
     this._setupSound(src, index.sons || []);
   }
 
@@ -173,9 +182,11 @@ export class Ithaca4DGS extends THREE.Object3D {
       this.totalFrames = d.frames || d.sequences.reduce((a, x) => Math.max(a, x.first + x.frames), 0);
       this._range = [0, this.totalFrames];
       this.index = { cadrage: d.framing, decalage_son: d.soundOffset, titre: d.title };
-      this.sequences = d.sequences.map((x) => ({ first: x.first, frames: x.frames, url: x.url, range: null }));
+      this.sequences = d.sequences.map((x) => ({ first: x.first, frames: x.frames, url: x.url, range: null,
+                                                 trainFirst: x.trainFirst, trainFrames: x.trainFrames }));
       this._setupSoundUrls(d.sounds);
     }
+    this._setupZones();
     this.dispatchEvent({ type: "load", index: this.index, share: d });
     await this._ensure(0);
   }
@@ -242,6 +253,7 @@ export class Ithaca4DGS extends THREE.Object3D {
         this._time = w.first / this.fps;
       }
       if (this._entries.get(k) !== e) return null;    // evicted meanwhile
+      e.win = this._trainWindow(s);
       if (k === 0 || !this._framed) this._frame(packed.bounds);
       const { pos, vel, opa } = packed.sort;
       this._sorter.postMessage({ type: "add", id: e.id, count: packed.count, pos, vel, opa }, [pos.buffer, vel.buffer, opa.buffer]);
@@ -259,10 +271,38 @@ export class Ithaca4DGS extends THREE.Object3D {
     return e.promise;
   }
 
+  /** Transitions (videos rendered with overlapping sequences, ITHACA « transition » setting): zone of each pair of
+      neighbour sequences a, a + 1, frames start…end where both are drawn; J = last frame of the core of a. */
+  _setupZones() {
+    const s = this.sequences;
+    this._zones = [];
+    if (!this.crossfade || s.length < 2 || !s.every((x) => x.trainFrames > 0)) return;
+    for (let a = 0; a + 1 < s.length; a++) {
+      const z = { a, start: s[a + 1].trainFirst, end: s[a].trainFirst + s[a].trainFrames - 1, J: s[a].first + s[a].frames - 1 };
+      if (z.end >= z.start) this._zones.push(z);
+    }
+  }
+
+  _zoneAt(f) { return this._zones.find((z) => f >= z.start && f <= z.end) || null; }
+
+  /** Opacity weights [previous, next] at frame f of a zone (same law as the ITHACA viewer): up to J the next sequence
+      fades in (1/(n+1) … n/(n+1)) over the full previous one; after J the previous one fades out over the full next. */
+  static _weights(z, f) {
+    const before = z.J - z.start + 1, after = z.end - z.J;
+    return f <= z.J ? [1, (f - z.start + 1) / (before + 1)] : [1 - (f - z.J) / (after + 1), 1];
+  }
+
+  /** Time window of a sequence during transitions: its training frames (same margins as format/pack.js). */
+  _trainWindow(s) {
+    if (!this._zones.length || !(s.trainFrames > 0) || this.totalFrames < 2) return null;
+    const dt = 1 / (this.totalFrames - 1);
+    return [s.trainFirst * dt - 0.02 * dt, (s.trainFirst + s.trainFrames - 1) * dt + 0.995 * dt];
+  }
+
   _evict(keep) {
     for (const [k, e] of this._entries) {
       if (keep.has(k)) continue;
-      if (e.handle) this.mesh.disposeData(e.handle);
+      if (e.handle) { this.mesh.disposeData(e.handle); this.fadeMesh.disposeData(e.handle); }
       this._sorter.postMessage({ type: "remove", id: e.id });
       this._entries.delete(k);
     }
@@ -295,6 +335,7 @@ export class Ithaca4DGS extends THREE.Object3D {
       const b = c.boite;
       const mode = b && b.mode === "interieur" ? 1 : b && b.mode === "exterieur" ? 2 : 0;
       this.mesh.setBox(mode, b && b.centre, b && (b.demi || []).map(Math.abs), m);
+      this.fadeMesh.setBox(mode, b && b.centre, b && (b.demi || []).map(Math.abs), m);
       if (mode === 1 && Array.isArray(b.centre) && Array.isArray(b.demi))
         this._sphere.box = { center: new THREE.Vector3().fromArray(b.centre),
                              radius: Math.max(Math.hypot(...b.demi), 1e-3) };
@@ -404,9 +445,13 @@ export class Ithaca4DGS extends THREE.Object3D {
 
     // keep the current and the next sequence; fetch / decode / upload / pre-sort the next ahead of time
     const next = k + 1 < n ? k + 1 : this.loop && n > 1 ? 0 : -1;
-    this._evict(new Set([k, next]));
+    // transition: inside the zone of two neighbour sequences both are drawn, each with its weight (frame begun)
+    const zone = this._zones.length ? this._zoneAt(Math.floor(frame)) : null;
+    const partner = zone ? (k === zone.a ? zone.a + 1 : zone.a) : -1;
+    this._evict(new Set([k, next, partner]));
     this._ensure(k);
     if (next >= 0) this._ensure(next);
+    if (partner >= 0) this._ensure(partner);
     const e = this._entries.get(k);
     if (e && e.state === "ready") {
       if (this._active !== k || this.mesh.current !== e.handle) {
@@ -424,9 +469,28 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.mesh.setTime(t);
     this._syncSound(false);
 
+    const pe = partner >= 0 ? this._entries.get(partner) : null;
+    const both = !!(zone && e && e.state === "ready" && pe && pe.state === "ready" && pe.order);
+    const [wPrev, wNext] = zone ? Ithaca4DGS._weights(zone, Math.floor(frame)) : [1, 1];
+    const wCur = !both ? 1 : k === zone.a ? wPrev : wNext, wPartner = k === zone?.a ? wNext : wPrev;
+    this.mesh.setFade(wCur, e && e.win);
+    this.mesh.renderOrder = wCur < 1 ? 1 : 0;           // the fading sequence is drawn over the full one
+    this.fadeMesh.visible = both;
+    if (both) {
+      if (this.fadeMesh.current !== pe.handle) { this.mesh.upload(pe.handle, renderer); this.fadeMesh.useData(pe.handle); }
+      this.fadeMesh.setTime(t);
+      this.fadeMesh.setFade(wPartner, pe.win);
+      this.fadeMesh.renderOrder = wPartner < 1 ? 1 : 0;
+      // sort both sequences in turn, at the current time
+      if (!this._sorting) return (this._req & 1) ? this._sort(pe, t, camera, false) : this._sort(e, t, camera, false);
+      return;
+    }
+
     // sort: current sequence; within AHEAD_S of the next one, alternate with a pre-sort of the next at its start
     const ne = next >= 0 ? this._entries.get(next) : null;
-    const startNext = next >= 0 ? this.sequences[next].first / this.fps : 0;
+    const sn = next >= 0 ? this.sequences[next] : null;
+    // with transitions the next sequence shows from the start of its zone
+    const startNext = sn ? (this._zones.length && next > 0 ? Math.min(sn.first, sn.trainFirst) : sn.first) / this.fps : 0;
     const untilNext = next > k ? startNext - this._time : next === 0 ? this._range[1] / this.fps - this._time : Infinity;
     if (ne && ne.state === "ready" && untilNext < AHEAD_S) {
       this.mesh.upload(ne.handle, renderer);       // one texture per frame: no hitch at the switch
@@ -444,7 +508,8 @@ export class Ithaca4DGS extends THREE.Object3D {
     this._req++;
     // keep what fades in during the next 2 video frames (the order is used for the coming frames)
     const lookahead = this.totalFrames > 1 ? 2 / (this.totalFrames - 1) : 0;
-    this._sorter.postMessage({ type: "sort", id: entry.id, req: this._req, time: t, ahead: lookahead, row: [m[2], m[6], m[10], m[14]] });
+    this._sorter.postMessage({ type: "sort", id: entry.id, req: this._req, time: t, ahead: lookahead, row: [m[2], m[6], m[10], m[14]],
+                               win: entry.win || null });
   }
 
   _onSorted({ id, order, visible, ms }) {
@@ -458,6 +523,7 @@ export class Ithaca4DGS extends THREE.Object3D {
     }
     for (const e of this._entries.values()) if (e.id === id && e.handle) {
       this.mesh.setOrder(e.handle, order, visible);
+      if (this.fadeMesh.current === e.handle) this.fadeMesh.setOrder(e.handle, order, visible);
       e.order = true;
       if (e.handle === this.mesh.current) { this.stats.visible = visible; this.stats.gaussians = e.handle.count; }
     }
@@ -536,6 +602,7 @@ export class Ithaca4DGS extends THREE.Object3D {
     this._decoder.terminate();
     this._sorter.terminate();
     this.mesh.dispose();
+    this.fadeMesh.dispose();
     if (this._sound) { this._sound.el.src = ""; if (this._sound.node) this.remove(this._sound.node); }
     this.removeFromParent();
   }

@@ -19,9 +19,10 @@ self.onmessage = ({ data: m }) => {
     if (!s) return;
     const t0 = performance.now();
     const { n, pos, vel, opa, depth, vis } = s, t = m.time, t2 = m.time + (m.ahead || 0), [a, b, c, d] = m.row;   // view z = a·x + b·y + c·z + d
+    const win = m.win || null;                                 // transitions: window of the sequence (its training frames)
     let k = 0;
     for (let i = 0; i < n; i++) {
-      const o3 = i * 3, p = i * 4, w0 = opa[o3 + 1], w1 = opa[o3 + 2], dt = t - pos[p + 3];
+      const o3 = i * 3, p = i * 4, w0 = win ? win[0] : opa[o3 + 1], w1 = win ? win[1] : opa[o3 + 2], dt = t - pos[p + 3];
       const now = t >= w0 && t < w1 && opa[o3] * Math.exp(-0.5 * (dt / vel[p + 3]) ** 2) >= MIN_ALPHA;
       if (!now) {
         const dt2 = t2 - pos[p + 3];

@@ -20,6 +20,9 @@ uniform int uBoxMode;         // 0 none, 1 keep inside, 2 keep outside
 uniform mat4 uToScene;        // model space → framed scene space (box test)
 uniform vec3 uBoxCenter, uBoxHalf;
 uniform float uMaxAxis;       // longest splat axis on screen (pixels)
+uniform float uOpacity;       // crossfade weight of the sequence (1 outside transitions)
+uniform int uWinOn;           // 1: sequence window uWin instead of the one of each gaussian (transitions)
+uniform vec2 uWin;
 
 in float splatIndex;
 out vec4 vColor;
@@ -35,12 +38,13 @@ void main() {
   ivec2 uv = ivec2(i & 2047, i >> 11);
   vec4 a = texelFetch(uA, uv, 0);
   uvec4 b = texelFetch(uB, uv, 0);
-  if (uTime < uintBitsToFloat(b.z) || uTime >= uintBitsToFloat(b.w)) { cull(); return; }
+  vec2 win = uWinOn != 0 ? uWin : vec2(uintBitsToFloat(b.z), uintBitsToFloat(b.w));
+  if (uTime < win.x || uTime >= win.y) { cull(); return; }
   vec2 vxy = unpackHalf2x16(b.x), vzd = unpackHalf2x16(b.y);
   float dt = uTime - a.w, xt = dt / vzd.y;
   uvec4 c = texelFetch(uC, uv, 0);
   vec2 szo = unpackHalf2x16(c.y);
-  float alpha = szo.y * exp(-0.5 * xt * xt);
+  float alpha = szo.y * exp(-0.5 * xt * xt) * uOpacity;
   if (alpha < 1.0 / 255.0) { cull(); return; }
   vec3 p = a.xyz + vec3(vxy, vzd.x) * dt;
 
