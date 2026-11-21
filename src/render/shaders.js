@@ -23,7 +23,7 @@ uniform float uMaxAxis;       // longest splat axis on screen (pixels)
 uniform float uOpacity;       // crossfade weight of the sequence (1 outside transitions)
 uniform int uTrigs;           // HD 4DGS (.trgz, format/trgz.js): screw motion with a Bézier rate, full SH
 uniform highp sampler2D uE;   // HD 4DGS: anchor + σ (s), Bézier control points (6 texels per gaussian)
-uniform usampler2D uF;        // HD 4DGS: SH degrees 1–3 as halves (6 texels per gaussian)
+uniform usampler2D uF;        // SH degrees 1–3 as halves (6 texels per gaussian): HD 4DGS, or HD at degree 2–3
 uniform float uTScale, uTCut; // HD 4DGS: seconds of model time per unit of video time; soft temporal cut
 uniform int uShDeg;           // HD 4DGS: SH degree
 
@@ -154,7 +154,7 @@ void main() {
     vec3 k3 = vec3(snorm8(e.z, 0u), snorm8(e.z, 24u), snorm8(e.w, 16u));
     col += uShScale * C1 * (-dir.y * k1 + dir.z * k2 - dir.x * k3);
   }
-  if (uTrigs == 1 && uShDeg > 0) {                       // HD 4DGS: SH up to degree 3
+  if (uShDeg > 0) {                                      // SH degrees 1–3 from texture F (HD 4DGS, or HD at degree 2–3)
     vec3 dir = normalize(p - uCamPos);
     float dx = dir.x, dy = dir.y, dz = dir.z;
     col += C1 * (-dy * shK(i, 0) + dz * shK(i, 1) - dx * shK(i, 2));

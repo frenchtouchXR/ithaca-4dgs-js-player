@@ -66,6 +66,13 @@ export function packHD(model, { direct = false } = {}) {
   const rest = fields.filter((f) => f.startsWith("f_rest_")).length, K = rest / 3;     // coefficients per channel
   const hasSH = K >= 3;
   const sh = hasSH ? [0, 1, 2, K, K + 1, K + 2, 2 * K, 2 * K + 1, 2 * K + 2].map((k) => at["f_rest_" + k]) : [];
+  // couleurs au-delà du degré 1 (livrables au degré 3 ou 2 distillé, 21/11/2026) : texture F (degrés 1–3 en demi-précision,
+  // même rangement que le HD 4DGS) et le shader passe par la branche des couleurs complètes ; degré 1 : texture D comme avant
+  const shDegree = Math.min(3, Math.floor(Math.sqrt(K + 1)) - 1);
+  const full = shDegree >= 2;
+  const HF = full ? Math.max(1, Math.ceil((n * 6) / TEX_WIDTH)) : 0, F = full ? new Uint32Array(TEX_WIDTH * HF * 4) : null;
+  const restF = [];                                          // champ de (coefficient k, canal c), k·3 + c
+  if (full) for (let k = 0; k < (shDegree + 1) ** 2 - 1; k++) for (let c = 0; c < 3; c++) restF.push(at["f_rest_" + (c * K + k)]);
 
   // SH scale: largest |coefficient| (8-bit quantization over [−shScale, shScale])
   let shScale = 0;
@@ -113,6 +120,10 @@ export function packHD(model, { direct = false } = {}) {
     D[p + 1] = (toHalf(0.5 + C0 * data[o + id2]) | (q[0] << 16) | (q[1] << 24)) >>> 0;
     D[p + 2] = (q[2] | (q[3] << 8) | (q[4] << 16) | (q[5] << 24)) >>> 0;
     D[p + 3] = (q[6] | (q[7] << 8) | (q[8] << 16)) >>> 0;
+    if (full) {
+      const fo = i * 24;
+      for (let k = 0; k < restF.length; k += 2) F[fo + k / 2] = half2(data[o + restF[k]], k + 1 < restF.length ? data[o + restF[k + 1]] : 0);
+    }
     sortPos[p] = x; sortPos[p + 1] = y; sortPos[p + 2] = z; sortPos[p + 3] = t;
     sortVel[p] = vx; sortVel[p + 1] = vy; sortVel[p + 2] = vz; sortVel[p + 3] = dur;
     sortOpa[i * 3] = opacity; sortOpa[i * 3 + 1] = fw[0]; sortOpa[i * 3 + 2] = fw[1];
@@ -129,12 +140,13 @@ export function packHD(model, { direct = false } = {}) {
   }
 
   return {
-    count: n, width: TEX_WIDTH, height: H, shScale: hasSH ? shScale : 0, frames,
+    count: n, width: TEX_WIDTH, height: H, shScale: hasSH && !full ? shScale : 0, frames,
+    shFull: full ? { heightF: HF, shDegree } : null,
     // frames of the video this sequence covers (null: the whole video)
     window: hasWindow && n > 0 && frames > 1
       ? { first: Math.round(wmin * (frames - 1)), count: Math.round(wmax * (frames - 1)) - Math.round(wmin * (frames - 1)) + 1 }
       : null,
-    textures: { A, B, C, D }, sort: { pos: sortPos, vel: sortVel, opa: sortOpa }, bounds: { min: lo, max: hi },
+    textures: full ? { A, B, C, D, F } : { A, B, C, D }, sort: { pos: sortPos, vel: sortVel, opa: sortOpa }, bounds: { min: lo, max: hi },
   };
 }
 

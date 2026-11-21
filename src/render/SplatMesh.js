@@ -74,7 +74,9 @@ export class SplatMesh extends THREE.Mesh {
     const { width: w, height: h, textures: t } = packed, tr = packed.trigs || null;
     const tex = [texture(t.A, w, h, true), texture(t.B, w, h, false), texture(t.C, w, h, false), texture(t.D, w, h, false)];
     if (tr) tex.push(texture(t.E, w, tr.heightE, true), texture(t.F, w, tr.heightF, false));   // HD 4DGS motion and SH
-    return { count: packed.count, shScale: packed.shScale, uploaded: 0, tex, trigs: tr, order: null, visible: 0 };
+    const sf = !tr && packed.shFull ? packed.shFull : null;                    // SH degree 2–3 of the HD (FreeTimeGS) layout
+    if (sf) tex.push(texture(t.F, w, sf.heightF, false));
+    return { count: packed.count, shScale: packed.shScale, uploaded: 0, tex, trigs: tr, shFull: sf, order: null, visible: 0 };
   }
 
   /** Uploads one more texture of handle (call once per frame ahead of a switch: no hitch at the switch). */
@@ -92,10 +94,10 @@ export class SplatMesh extends THREE.Mesh {
     const tr = handle && handle.trigs;
     u.uTrigs.value = tr ? 1 : 0;
     u.uE.value = tr ? handle.tex[4] : neutral().E;
-    u.uF.value = tr ? handle.tex[5] : neutral().F;
+    u.uF.value = tr ? handle.tex[5] : handle && handle.shFull ? handle.tex[4] : neutral().F;
     u.uTScale.value = tr ? tr.tScale : 1;
     u.uTCut.value = tr ? tr.cut : 0;
-    u.uShDeg.value = tr ? tr.shDegree : 0;
+    u.uShDeg.value = tr ? tr.shDegree : handle && handle.shFull ? handle.shFull.shDegree : 0;
     this._applyOrder();
   }
 
