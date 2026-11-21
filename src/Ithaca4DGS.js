@@ -264,8 +264,9 @@ export class Ithaca4DGS extends THREE.Object3D {
         }
       }
       if (k === 0 || !this._framed) this._frame(packed.bounds);
-      const { pos, vel, opa } = packed.sort;
-      this._sorter.postMessage({ type: "add", id: e.id, count: packed.count, pos, vel, opa }, [pos.buffer, vel.buffer, opa.buffer]);
+      const { pos, vel, opa, mot, trigs } = packed.sort;          // mot, trigs: HD 4DGS (.trgz) motion
+      this._sorter.postMessage({ type: "add", id: e.id, count: packed.count, pos, vel, opa, mot, trigs },
+                               [pos.buffer, vel.buffer, opa.buffer, ...(mot ? [mot.buffer] : [])]);
       e.handle = this.mesh.setData(packed);
       e.state = "ready";
       this.dispatchEvent({ type: "progress", loaded: [...this._entries.values()].filter((x) => x.state === "ready").length,

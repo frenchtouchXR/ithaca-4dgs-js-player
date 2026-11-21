@@ -249,3 +249,67 @@ export function packLQ(model, seq) {
   return packHD({ header: `ply\ncomment n_frames ${N}\nend_header\n`, fields: F, count: out.length, data: flat },
                         { direct: true });
 }
+
+// ── HD 4DGS (.trgz, format/trgz.js) ───────────────────────────────────────────────────────────────────────────────────
+// Same textures A–D as the HD layout (A: x, y, z, central time μ in video time; B: window; C: scales, opacity, base
+// orientation; D: base colour, no SH there), plus:
+//   E  RGBA32F   6 texels per gaussian: (anchor xyz, σ in s), then the three Bézier control points P0, P1, P2 (6 each)
+//   F  RGBA32UI  6 texels per gaussian: SH coefficients of degrees 1–3 as halves, coefficient k of channel c at k·3 + c
+// The motion is evaluated in the vertex shader (uTrigs) and, for the depth order, in the sort worker.
+export const TRIGS_E = 6, TRIGS_F = 6;
+
+/** HD 4DGS sequence (decodeTrgz) → packed layout. seq: { first, frames, total } (place of the sequence in the video). */
+export function packTrigs(model, seq = {}) {
+  const { trgz: hz, fields, count: n, data } = model, nf = fields.length;
+  const at = Object.fromEntries(fields.map((f, i) => [f, i]));
+  const fps = Number(hz.fps_modele) || 30, cut = Number(hz.coupure) || 0, deg = Math.min(3, hz.sh_degree | 0), ks = hz.sh_source | 0;
+  const frames = seq.frames || hz.images || 2, first = seq.first || 0, total = Math.max(2, seq.total || first + frames);
+  const tScale = (total - 1) / fps, u0 = first / (total - 1), dt = 1 / (total - 1);
+  const H = Math.max(1, Math.ceil(n / TEX_WIDTH)), texels = TEX_WIDTH * H * 4;
+  const HE = Math.max(1, Math.ceil((n * TRIGS_E) / TEX_WIDTH)), HF = Math.max(1, Math.ceil((n * TRIGS_F) / TEX_WIDTH));
+  const A = new Float32Array(texels), B = new Uint32Array(texels), C = new Uint32Array(texels), D = new Uint32Array(texels);
+  const E = new Float32Array(TEX_WIDTH * HE * 4), F = new Uint32Array(TEX_WIDTH * HF * 4);
+  const sortPos = new Float32Array(n * 4), sortOpa = new Float32Array(n * 3), sortMot = new Float32Array(n * 22);
+  const fw = new Float32Array([first * dt - 0.02 * dt, (first + frames - 1) * dt + 0.995 * dt]), uw = new Uint32Array(fw.buffer);
+  const g = (o, f) => data[o + at[f]];
+  const nk = (deg + 1) ** 2 - 1;
+  const rest = [];                                           // field index of (coefficient k, channel c)
+  for (let k = 0; k < nk; k++) for (let c = 0; c < 3; c++) rest.push(at["f_rest_" + (c * ks + k)]);
+  for (let i = 0; i < n; i++) {
+    const o = i * nf, p = i * 4;
+    const x = g(o, "x"), y = g(o, "y"), z = g(o, "z"), mu = u0 + g(o, "mu") / tScale, sig = Math.max(Math.exp(g(o, "log_sigma")), 1e-6);
+    const opacity = 1 / (1 + Math.exp(-g(o, "opacity")));
+    let qw = g(o, "rot_0"), qx = g(o, "rot_1"), qy = g(o, "rot_2"), qz = g(o, "rot_3");
+    const ql = Math.hypot(qw, qx, qy, qz) || 1;
+    qw /= ql; qx /= ql; qy /= ql; qz /= ql;
+    A[p] = x; A[p + 1] = y; A[p + 2] = z; A[p + 3] = mu;
+    B[p + 2] = uw[0]; B[p + 3] = uw[1];
+    C[p] = half2(Math.exp(g(o, "scale_0")), Math.exp(g(o, "scale_1")));
+    C[p + 1] = half2(Math.exp(g(o, "scale_2")), opacity);
+    [C[p + 2], C[p + 3]] = quat16([qx, qy, qz, qw]);
+    D[p] = half2(0.5 + C0 * g(o, "f_dc_0"), 0.5 + C0 * g(o, "f_dc_1"));
+    D[p + 1] = toHalf(0.5 + C0 * g(o, "f_dc_2")) >>> 0;
+    const mrow = [g(o, "anchor_0"), g(o, "anchor_1"), g(o, "anchor_2"), sig];
+    for (let c = 0; c < 3; c++) for (let j = 0; j < 6; j++) mrow.push(g(o, `p${c}_${j}`));
+    E.set(mrow, i * TRIGS_E * 4);
+    sortMot.set(mrow, i * 22);
+    const fo = i * TRIGS_F * 4;
+    for (let k = 0; k < rest.length; k += 2) F[fo + k / 2] = half2(data[o + rest[k]], k + 1 < rest.length ? data[o + rest[k + 1]] : 0);
+    sortPos[p] = x; sortPos[p + 1] = y; sortPos[p + 2] = z; sortPos[p + 3] = mu;
+    sortOpa[i * 3] = opacity; sortOpa[i * 3 + 1] = fw[0]; sortOpa[i * 3 + 2] = fw[1];
+  }
+  const step = Math.max(1, Math.floor(n / 8192)), m = Math.ceil(n / step), lo = [0, 0, 0], hi = [0, 0, 0];
+  const v = new Float32Array(m);
+  for (let a = 0; a < 3 && n > 0; a++) {
+    for (let i = 0, k = 0; i < n; i += step, k++) v[k] = A[i * 4 + a];
+    v.sort();
+    lo[a] = v[Math.floor((m - 1) * 0.01)];
+    hi[a] = v[Math.ceil((m - 1) * 0.99)];
+  }
+  return {
+    count: n, width: TEX_WIDTH, height: H, shScale: 0, frames: total, window: null,
+    trigs: { tScale, cut, shDegree: deg, heightE: HE, heightF: HF },
+    textures: { A, B, C, D, E, F }, sort: { pos: sortPos, vel: new Float32Array(n * 4), opa: sortOpa, mot: sortMot,
+                                            trigs: { tScale, cut } }, bounds: { min: lo, max: hi },
+  };
+}

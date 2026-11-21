@@ -4,6 +4,8 @@
 // window, opacity ≥ 1/255, in front of the camera), 16-bit counting sort on view depth at t. Never blocks rendering:
 // the renderer keeps drawing with the last order received, for the next frames, while gaussians keep fading in;
 // those visible up to `ahead` later are therefore kept too (the shader still culls at the exact time).
+import { screwCentre } from "../format/trgz.js";
+
 const sets = new Map();
 const MIN_ALPHA = 1 / 255, BUCKETS = 65536;
 const counts = new Uint32Array(BUCKETS);
@@ -11,8 +13,8 @@ const counts = new Uint32Array(BUCKETS);
 self.onmessage = ({ data: m }) => {
   if (m.type === "add") {
     const n = m.count;
-    sets.set(m.id, { n, pos: m.pos, vel: m.vel, opa: m.opa, depth: new Float32Array(n), vis: new Uint32Array(n),
-                     keys: null });
+    sets.set(m.id, { n, pos: m.pos, vel: m.vel, opa: m.opa, mot: m.mot || null, trigs: m.trigs || null,
+                     depth: new Float32Array(n), vis: new Uint32Array(n), keys: null });
   } else if (m.type === "remove") sets.delete(m.id);
   else if (m.type === "sort") {
     const s = sets.get(m.id);
@@ -20,7 +22,25 @@ self.onmessage = ({ data: m }) => {
     const t0 = performance.now();
     const { n, pos, vel, opa, depth, vis } = s, t = m.time, t2 = m.time + (m.ahead || 0), [a, b, c, d] = m.row;   // view z = a·x + b·y + c·z + d
     let k = 0;
-    for (let i = 0; i < n; i++) {
+    if (s.trigs) {                                            // HD 4DGS: screw motion (format/trgz.js), soft temporal cut
+      const { tScale, cut } = s.trigs, mot = s.mot, x = [0, 0, 0], ctr = [0, 0, 0];
+      const w = (i, tt) => {
+        const sg = mot[i * 22 + 3], dd = (tt - pos[i * 4 + 3]) * tScale;
+        let gm = Math.exp(-0.5 * (dd / sg) * (dd / sg));
+        if (cut > 0) gm = Math.max((gm - cut) / (1 - cut), 0);
+        return opa[i * 3] * gm;
+      };
+      for (let i = 0; i < n; i++) {
+        const o3 = i * 3, p = i * 4, w0 = opa[o3 + 1], w1 = opa[o3 + 2];
+        const now = t >= w0 && t < w1 && w(i, t) >= MIN_ALPHA;
+        if (!now && (t2 < w0 || t2 >= w1 || w(i, t2) < MIN_ALPHA)) continue;
+        x[0] = pos[p]; x[1] = pos[p + 1]; x[2] = pos[p + 2];
+        screwCentre(x, mot.subarray(i * 22, i * 22 + 22), (t - pos[p + 3]) * tScale, ctr);
+        const z = a * ctr[0] + b * ctr[1] + c * ctr[2] + d;
+        if (z > -1e-3) continue;
+        vis[k] = i; depth[k] = -z; k++;
+      }
+    } else for (let i = 0; i < n; i++) {
       const o3 = i * 3, p = i * 4, w0 = opa[o3 + 1], w1 = opa[o3 + 2], dt = t - pos[p + 3];
       const now = t >= w0 && t < w1 && opa[o3] * Math.exp(-0.5 * (dt / vel[p + 3]) ** 2) >= MIN_ALPHA;
       if (!now) {

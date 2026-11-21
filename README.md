@@ -12,11 +12,13 @@ flat screen.
 **Examples to download:** the [ITHACA Featured 4DGS gallery](https://www.ithaca.eu/featured-4dgs/) — download button
 on each video (`.4dgs` or `.ftgsz`, both read by this player), or play them directly by their share link.
 
-- **Files**: `.4dgs` (one file: sequences, sound, framing; streamed by HTTP ranges), `.ftgsz` sequences, raw `.ply`
-  sequences of ITHACA renders, ITHACA `manifest.json` (sequences next to it) — from a URL or a local `File`
+- **Files**: `.4dgs` (one file: sequences, sound, framing; streamed by HTTP ranges), `.ftgsz` and `.trgz` sequences,
+  raw `.ply` sequences of ITHACA renders, ITHACA `manifest.json` (sequences next to it) — from a URL or a local `File`
 - **ITHACA links**: a share link (`https://www.ithaca.eu/?ithaca_partage=…`) or its token plays directly
 - **Featured 4DGS**: `listFeatured()` returns the videos of the ITHACA gallery (title, creator, thumbnails, duration…)
-- HD and Low Quality ITHACA renders
+- HD 4DGS (`.trgz`, since 0.3.0), HD and Low Quality ITHACA renders. HD 4DGS gaussians keep their own motion: a
+  rigid screw motion (rotation + translation) whose rate follows a quadratic Bézier curve over each gaussian's life, so
+  both their centre and their orientation change over time; colours up to spherical harmonics degree 3
 - Plays while loading: decoding and depth sorting run in Web Workers; the next sequence is fetched, decoded, uploaded
   and pre-sorted before it is needed; the sound is the master clock
 - Transitions: videos rendered with a transition between sequences (ITHACA expert setting) crossfade from one sequence
@@ -131,6 +133,7 @@ ITHACA share links and the Featured 4DGS gallery are read from `www.ithaca.eu`, 
 | `"https://www.ithaca.eu/?ithaca_partage=<token>"`, `"ithaca:<token>"` or `"<token>"` | an ITHACA share: its `.4dgs`, or its sequences and sound, with the framing set by its owner. Each opening counts one view of the share. Signed links are refreshed when they expire |
 | `"…/manifest.json"` | an ITHACA render folder (HD or Low Quality sequences listed in the manifest) |
 | `"seq001.ftgsz"`, `"seq001.ply"` | one HD sequence |
+| `"seq001.trgz"` | one HD 4DGS sequence |
 | `"seg1.ftgsz"` / `"seg1.ply"` with `frames: 65` | one Low Quality sequence: its file does not say its frame count, give it |
 | a `File` or `Blob` (file picker, drag and drop) | any of the formats above; use `format` when the name does not tell |
 
@@ -178,7 +181,7 @@ playing it; `shareToken(url)` extracts the token of a share link; `shareUrl(toke
 | `applyFraming` | `true` | apply the framing set on the ITHACA platform (`.4dgs`, share links) |
 | `frames` | `null` | frame count of a lone Low Quality sequence |
 | `crossfade` | `true` | crossfade between sequences in videos rendered with a transition (`false`: hard cut) |
-| `format` | `null` | `"4dgs"`, `"manifest"`, `"ftgsz"` or `"ply"` when the name does not tell (a `Blob`) |
+| `format` | `null` | `"4dgs"`, `"manifest"`, `"ftgsz"`, `"trgz"` or `"ply"` when the name does not tell (a `Blob`) |
 | `server` | `"https://www.ithaca.eu"` | ITHACA site that resolves share links |
 | `fetchFn` | `fetch` | custom fetch (headers, credentials, signed URLs…) |
 

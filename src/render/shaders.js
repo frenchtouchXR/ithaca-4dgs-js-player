@@ -21,12 +21,32 @@ uniform mat4 uToScene;        // model space → framed scene space (box test)
 uniform vec3 uBoxCenter, uBoxHalf;
 uniform float uMaxAxis;       // longest splat axis on screen (pixels)
 uniform float uOpacity;       // crossfade weight of the sequence (1 outside transitions)
+uniform int uTrigs;           // HD 4DGS (.trgz, format/trgz.js): screw motion with a Bézier rate, full SH
+uniform highp sampler2D uE;   // HD 4DGS: anchor + σ (s), Bézier control points (6 texels per gaussian)
+uniform usampler2D uF;        // HD 4DGS: SH degrees 1–3 as halves (6 texels per gaussian)
+uniform float uTScale, uTCut; // HD 4DGS: seconds of model time per unit of video time; soft temporal cut
+uniform int uShDeg;           // HD 4DGS: SH degree
 
 in float splatIndex;
 out vec4 vColor;
 out vec2 vUv;
 
 const float C1 = 0.4886025119029199;
+const float SC2[5] = float[](1.0925484305920792, -1.0925484305920792, 0.31539156525252005, -1.0925484305920792, 0.5462742152960396);
+const float SC3[7] = float[](-0.5900435899266435, 2.890611442640554, -0.4570457994644658, 0.3731763325901154, -0.4570457994644658, 1.445305721320277, -0.5900435899266435);
+ivec2 tex(int k) { return ivec2(k & 2047, k >> 11); }
+vec4 eT(int i, int k) { return texelFetch(uE, tex(i * 6 + k), 0); }
+// SH coefficient k (degree ≥ 1, k = 0…14) of gaussian i: halves k·3 + c in the uints of texture F
+float shHalf(int i, int h) {
+  uvec4 t = texelFetch(uF, tex(i * 6 + (h >> 3)), 0);
+  int j = (h >> 1) & 3;
+  uint u = j == 0 ? t.x : j == 1 ? t.y : j == 2 ? t.z : t.w;
+  return unpackHalf2x16(u)[h & 1];
+}
+vec3 shK(int i, int k) { return vec3(shHalf(i, k * 3), shHalf(i, k * 3 + 1), shHalf(i, k * 3 + 2)); }
+vec4 qmul(vec4 a, vec4 b) {   // quaternions (w, x, y, z)
+  return vec4(a.x * b.x - dot(a.yzw, b.yzw), a.x * b.yzw + b.x * a.yzw + cross(a.yzw, b.yzw));
+}
 
 float snorm8(uint u, uint s) { return (float((u >> s) & 255u) - 128.0) / 127.0; }
 void cull() { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); vColor = vec4(0.0); vUv = vec2(0.0); }
@@ -41,9 +61,36 @@ void main() {
   float dt = uTime - a.w, xt = dt / vzd.y;
   uvec4 c = texelFetch(uC, uv, 0);
   vec2 szo = unpackHalf2x16(c.y);
-  float alpha = szo.y * exp(-0.5 * xt * xt) * uOpacity;
-  if (alpha < 1.0 / 255.0) { cull(); return; }
-  vec3 p = a.xyz + vec3(vxy, vzd.x) * dt;
+  float alpha;
+  vec3 p;
+  vec4 qs = vec4(1.0, 0.0, 0.0, 0.0);                     // HD 4DGS: rotation added by the motion (w, x, y, z)
+  if (uTrigs == 1) {
+    vec4 e0 = eT(i, 0), e1 = eT(i, 1), e2 = eT(i, 2), e3 = eT(i, 3), e4 = eT(i, 4), e5 = eT(i, 5);
+    float dts = dt * uTScale, sig = e0.w;
+    float gm = exp(-0.5 * (dts / sig) * (dts / sig));
+    if (uTCut > 0.0) gm = max((gm - uTCut) / (1.0 - uTCut), 0.0);
+    alpha = szo.y * gm * uOpacity;
+    if (alpha < 1.0 / 255.0) { cull(); return; }
+    // control points: P0 = (e1.xyz | e1.w e2.xy), P1 = (e2.zw e3.x | e3.yzw), P2 = (e4.xyz | e4.w e5.xy)
+    float tau = clamp((dts + 2.0 * sig) / (4.0 * sig), 0.0, 1.0), b0 = (1.0 - tau) * (1.0 - tau), b1 = 2.0 * (1.0 - tau) * tau, b2 = tau * tau;
+    vec3 nu = b0 * e1.xyz + b1 * vec3(e2.zw, e3.x) + b2 * e4.xyz;
+    vec3 om = b0 * vec3(e1.w, e2.xy) + b1 * e3.yzw + b2 * vec3(e4.w, e5.xy);
+    float w2 = dot(om, om);
+    vec3 an = e0.xyz;
+    if (w2 >= 1e-8) { float dd = max(w2, 1e-10); an -= (dot(e0.xyz, om) / dd) * om; nu = (dot(nu, om) / dd) * om; }
+    vec3 phi = om * dts, rho = nu * dts;
+    float t2 = dot(phi, phi), th = sqrt(t2), qw, qsn, Bc, Cc;
+    if (t2 < 1e-8) { qw = 1.0 - t2 / 8.0; qsn = 0.5 - t2 / 48.0; Bc = 0.5 - t2 / 24.0; Cc = 1.0 / 6.0 - t2 / 120.0; }
+    else { qw = cos(0.5 * th); qsn = sin(0.5 * th) / th; Bc = (1.0 - cos(th)) / t2; Cc = (th - sin(th)) / (t2 * th); }
+    qs = normalize(vec4(qw, phi * qsn));
+    vec3 c1 = cross(phi, rho), pp = rho + Bc * c1 + Cc * cross(phi, c1);
+    vec3 v = a.xyz - an, tq = 2.0 * cross(qs.yzw, v);
+    p = v + qs.x * tq + cross(qs.yzw, tq) + an + pp;
+  } else {
+    alpha = szo.y * exp(-0.5 * xt * xt) * uOpacity;
+    if (alpha < 1.0 / 255.0) { cull(); return; }
+    p = a.xyz + vec3(vxy, vzd.x) * dt;
+  }
 
   if (uBoxMode != 0) {
     vec3 q = (uToScene * vec4(p, 1.0)).xyz;
@@ -63,6 +110,7 @@ void main() {
   uint im = (c.w >> 16) & 3u;
   float big = sqrt(max(0.0, 1.0 - dot(sm, sm)));
   vec4 r = im == 0u ? vec4(big, sm) : im == 1u ? vec4(sm.x, big, sm.y, sm.z) : im == 2u ? vec4(sm.x, sm.y, big, sm.z) : vec4(sm, big);
+  if (uTrigs == 1) { vec4 qt = normalize(qmul(qs, vec4(r.w, r.xyz))); r = vec4(qt.yzw, qt.x); }   // orientation at time t
   float x = r.x, y = r.y, z = r.z, w = r.w;
   mat3 R = mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
                 2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
@@ -105,6 +153,21 @@ void main() {
     vec3 k2 = vec3(snorm8(e.y, 24u), snorm8(e.z, 16u), snorm8(e.w, 8u));
     vec3 k3 = vec3(snorm8(e.z, 0u), snorm8(e.z, 24u), snorm8(e.w, 16u));
     col += uShScale * C1 * (-dir.y * k1 + dir.z * k2 - dir.x * k3);
+  }
+  if (uTrigs == 1 && uShDeg > 0) {                       // HD 4DGS: SH up to degree 3
+    vec3 dir = normalize(p - uCamPos);
+    float dx = dir.x, dy = dir.y, dz = dir.z;
+    col += C1 * (-dy * shK(i, 0) + dz * shK(i, 1) - dx * shK(i, 2));
+    if (uShDeg > 1) {
+      float xx = dx * dx, yy = dy * dy, zz = dz * dz;
+      col += SC2[0] * dx * dy * shK(i, 3) + SC2[1] * dy * dz * shK(i, 4) + SC2[2] * (2.0 * zz - xx - yy) * shK(i, 5)
+           + SC2[3] * dx * dz * shK(i, 6) + SC2[4] * (xx - yy) * shK(i, 7);
+      if (uShDeg > 2) {
+        col += SC3[0] * dy * (3.0 * xx - yy) * shK(i, 8) + SC3[1] * dx * dy * dz * shK(i, 9) + SC3[2] * dy * (4.0 * zz - xx - yy) * shK(i, 10)
+             + SC3[3] * dz * (2.0 * zz - 3.0 * xx - 3.0 * yy) * shK(i, 11) + SC3[4] * dx * (4.0 * zz - xx - yy) * shK(i, 12)
+             + SC3[5] * dz * (xx - yy) * shK(i, 13) + SC3[6] * dx * (xx - 3.0 * yy) * shK(i, 14);
+      }
+    }
   }
   vColor = vec4(clamp(col, 0.0, 1.0), alpha);   // clamped to [0, 1] like the reference gaussian rasterizers (brighter haze otherwise)
   vUv = position.xy;

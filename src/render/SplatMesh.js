@@ -34,6 +34,11 @@ function texture(data, w, h, float) {
   return t;
 }
 
+// neutral 1-texel textures bound to the HD 4DGS samplers for the other formats (an integer sampler must never see a
+// float texture: the draw would fail)
+let NEUTRAL = null;
+const neutral = () => NEUTRAL || (NEUTRAL = { E: texture(new Float32Array(4), 1, 1, true), F: texture(new Uint32Array(4), 1, 1, false) });
+
 export class SplatMesh extends THREE.Mesh {
   constructor() {
     const geometry = quadGeometry(0);
@@ -48,6 +53,8 @@ export class SplatMesh extends THREE.Mesh {
         uCamPos: { value: new THREE.Vector3() }, uBoxMode: { value: 0 }, uToScene: { value: new THREE.Matrix4() },
         uBoxCenter: { value: new THREE.Vector3() }, uBoxHalf: { value: new THREE.Vector3(1, 1, 1) }, uMaxAxis: { value: 1e6 },   // no cap on the splat size (as the reference gaussian rasterizers)
         uOpacity: { value: 1 },
+        uTrigs: { value: 0 }, uE: { value: neutral().E }, uF: { value: neutral().F }, uTScale: { value: 1 }, uTCut: { value: 0 },
+        uShDeg: { value: 0 },
       },
     });
     // attribute 0 must be the per-vertex one: ANGLE on Direct3D 11 (Chrome / Edge on Windows) otherwise repeats the
@@ -64,10 +71,10 @@ export class SplatMesh extends THREE.Mesh {
 
   /** Creates the GPU textures of a packed sequence (uploaded lazily, or ahead with upload()). */
   setData(packed) {
-    const { width: w, height: h, textures: t } = packed;
-    return { count: packed.count, shScale: packed.shScale, uploaded: 0,
-             tex: [texture(t.A, w, h, true), texture(t.B, w, h, false), texture(t.C, w, h, false), texture(t.D, w, h, false)],
-             order: null, visible: 0 };
+    const { width: w, height: h, textures: t } = packed, tr = packed.trigs || null;
+    const tex = [texture(t.A, w, h, true), texture(t.B, w, h, false), texture(t.C, w, h, false), texture(t.D, w, h, false)];
+    if (tr) tex.push(texture(t.E, w, tr.heightE, true), texture(t.F, w, tr.heightF, false));   // HD 4DGS motion and SH
+    return { count: packed.count, shScale: packed.shScale, uploaded: 0, tex, trigs: tr, order: null, visible: 0 };
   }
 
   /** Uploads one more texture of handle (call once per frame ahead of a switch: no hitch at the switch). */
@@ -82,6 +89,13 @@ export class SplatMesh extends THREE.Mesh {
     this.current = handle;
     [u.uA.value, u.uB.value, u.uC.value, u.uD.value] = handle ? handle.tex : [null, null, null, null];
     u.uShScale.value = handle ? handle.shScale : 0;
+    const tr = handle && handle.trigs;
+    u.uTrigs.value = tr ? 1 : 0;
+    u.uE.value = tr ? handle.tex[4] : neutral().E;
+    u.uF.value = tr ? handle.tex[5] : neutral().F;
+    u.uTScale.value = tr ? tr.tScale : 1;
+    u.uTCut.value = tr ? tr.cut : 0;
+    u.uShDeg.value = tr ? tr.shDegree : 0;
     this._applyOrder();
   }
 

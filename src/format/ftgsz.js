@@ -35,16 +35,21 @@ function deballer(octets, n, bits, m) {
 const pause = () => new Promise((ok) => setTimeout(ok));
 
 /** Decodes a .ftgsz (ArrayBuffer) into { header (PLY header text), fields, count, data (Float32Array, count × fields) }. */
-export async function decodeFtgsz(tampon, { signal, onProgress = () => {} } = {}) {
+export async function decodeFtgsz(tampon, options = {}) {
   const octets = new Uint8Array(tampon);
   if (new TextDecoder().decode(octets.subarray(0, 8)) !== "FTGSZ002") throw new Error("Not a .ftgsz file (version 2).");
   const lg = new DataView(tampon).getUint32(8, true);
   const h = JSON.parse(new TextDecoder().decode(octets.subarray(12, 12 + lg)));
-  const n = h.gaussiennes, bl = h.bloc;
-  const champs = [...h.ply.matchAll(/property float (\S+)/g)].map((m) => m[1]), nc = champs.length;
+  const champs = [...h.ply.matchAll(/property float (\S+)/g)].map((m) => m[1]);
+  return { header: h.ply, ...(await decodeStreams(octets, h, 12 + lg, champs, options)) };
+}
+
+/** Streams of a .ftgsz-like container (header h, first stream at pos) → { fields, count, data } (also used by the HD
+    4DGS .trgz files, format/trgz.js). */
+export async function decodeStreams(octets, h, pos, champs, { signal, onProgress = () => {} } = {}) {
+  const n = h.gaussiennes, bl = h.bloc, nc = champs.length;
   const indice = Object.fromEntries(champs.map((c, i) => [c, i]));
   const donnees = {};
-  let pos = 12 + lg;
   for (const f of h.flux) {
     signal?.throwIfAborted();
     const brut = octets.subarray(pos, pos + f.octets);
@@ -62,7 +67,9 @@ export async function decodeFtgsz(tampon, { signal, onProgress = () => {} } = {}
       const bornes = new Float32Array(d.slice().buffer);
       const ent = deballer(donnees[f.nom], n, f.bits, f.octets_mot);
       f.champs.forEach((champ, j) => {
-        const c = indice[champ], max = 2 ** f.bits[j] - 1, tr = (f.transfo || [])[j] || "";
+        const c = indice[champ];
+        if (c === undefined) return;
+        const max = 2 ** f.bits[j] - 1, tr = (f.transfo || [])[j] || "";
         for (let i = 0; i < n; i++) {
           const b = Math.floor(i / bl) * 2 * k, mn = bornes[b + j], mx = bornes[b + k + j];
           let v = mn + (ent[j][i] / max) * (mx - mn);
@@ -97,5 +104,5 @@ export async function decodeFtgsz(tampon, { signal, onProgress = () => {} } = {}
     // « zero » : déjà à 0 ; « donnees » : bornes, palettes, tables (lues ci-dessus)
   }
   onProgress(1);
-  return { header: h.ply, fields: champs, count: n, data: sortie };
+  return { fields: champs, count: n, data: sortie };
 }
