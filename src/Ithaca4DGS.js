@@ -240,7 +240,10 @@ export class Ithaca4DGS extends THREE.Object3D {
       this.stats.fetchMs = performance.now() - tf;
       const sq = this.sequences[k];
       // Low Quality needs the place of the sequence in the video (its time is local): known from the .4dgs index
-      const packed = await this._decode(bytes, { first: sq.first, frames: sq.frames, total: this.totalFrames });
+      // HD 4DGS : temps du modèle compté depuis la première image d'ENTRAÎNEMENT (transition, 21/11/2026)
+      const tr = sq.trainFrames > 0 && sq.trainFirst != null;
+      const packed = await this._decode(bytes, { first: tr ? sq.trainFirst : sq.first, frames: tr ? sq.trainFrames : sq.frames,
+                                                 total: this.totalFrames });
       this.stats.decodeMs = packed.ms.decode;
       this.stats.packMs = packed.ms.pack;
       const s = this.sequences[k];
