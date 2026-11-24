@@ -2,10 +2,14 @@
 // Copyright (c) 2026 French Touch Factory / ITHACA
 //
 // Renderer of one 4DGS sequence at a time, behind a small interface so that it can be swapped for another splat
-// engine later:   setData(packed) → handle ; useData(handle) ; setOrder(handle, order, visible) ; setTime(t) ;
-//                 setFade(opacity) ; setBox(mode, center, half, toScene) ; disposeData(handle) ; dispose()
+// engine later:   setData(packed) → handle ; upload(handle, renderer, maxBytes) ; useData(handle) ;
+//                 setOrder(handle, order, visible) ; setTime(t) ; setFade(opacity) ; setSideWeights(w1, w2) ;
+//                 setBox(mode, center, half, toScene) ; releaseData(handle) ; disposeData(handle) ; dispose()
+// 0.4.0: textures uploaded by bands of rows within a byte budget (render/gpuTextures.js) instead of one texImage2D each;
+// junction models of the crossfade (format/junction.js) drawn with the weights of their two sides.
 import * as THREE from "three";
 import { vertexShader, fragmentShader } from "./shaders.js";
+import { textureJob, uploadJobs, release } from "./gpuTextures.js";
 
 const QUAD = new Float32Array([-2, -2, 0, 2, -2, 0, 2, 2, 0, -2, 2, 0]);
 
@@ -54,7 +58,7 @@ export class SplatMesh extends THREE.Mesh {
         uBoxCenter: { value: new THREE.Vector3() }, uBoxHalf: { value: new THREE.Vector3(1, 1, 1) }, uMaxAxis: { value: 1e6 },   // no cap on the splat size (as the reference gaussian rasterizers)
         uOpacity: { value: 1 },
         uTrigs: { value: 0 }, uE: { value: neutral().E }, uF: { value: neutral().F }, uTScale: { value: 1 }, uTCut: { value: 0 },
-        uShDeg: { value: 0 },
+        uShDeg: { value: 0 }, uSideW: { value: new THREE.Vector2(1, 1) },
       },
     });
     // attribute 0 must be the per-vertex one: ANGLE on Direct3D 11 (Chrome / Edge on Windows) otherwise repeats the
@@ -69,32 +73,52 @@ export class SplatMesh extends THREE.Mesh {
     this.onRender = null;                                 // hook (renderer, camera) of the owner, once per draw
   }
 
-  /** Creates the GPU textures of a packed sequence (uploaded lazily, or ahead with upload()). */
+  /** Prepares the GPU textures of a packed sequence (sent by upload(), ahead of use; else when first drawn). */
   setData(packed) {
     const { width: w, height: h, textures: t } = packed, tr = packed.trigs || null;
-    const tex = [texture(t.A, w, h, true), texture(t.B, w, h, false), texture(t.C, w, h, false), texture(t.D, w, h, false)];
-    if (tr) tex.push(texture(t.E, w, tr.heightE, true), texture(t.F, w, tr.heightF, false));   // HD 4DGS motion and SH
+    const jobs = { A: textureJob(t.A, w, h), B: textureJob(t.B, w, h), C: textureJob(t.C, w, h), D: textureJob(t.D, w, h) };
+    if (tr) jobs.E = textureJob(t.E, w, tr.heightE);                         // HD 4DGS motion
+    if (tr && t.F) jobs.F = textureJob(t.F, w, tr.heightF);                  // HD 4DGS SH (none in light mode)
     const sf = !tr && packed.shFull ? packed.shFull : null;                    // SH degree 2–3 of the HD (FreeTimeGS) layout
-    if (sf) tex.push(texture(t.F, w, sf.heightF, false));
-    return { count: packed.count, shScale: packed.shScale, uploaded: 0, tex, trigs: tr, shFull: sf, order: null, visible: 0 };
+    if (sf) jobs.F = textureJob(t.F, w, sf.heightF);
+    const list = Object.values(jobs), bytes = list.reduce((a, j) => a + j.w * j.h * 16, 0);
+    return { count: packed.count, shScale: packed.shScale, jobs, tex: list.map((j) => j.tex), trigs: tr, shFull: sf, order: null,
+             visible: 0, bytes, remaining: bytes, renderer: null, junction: packed.junction ?? null };
   }
 
-  /** Uploads one more texture of handle (call once per frame ahead of a switch: no hitch at the switch). */
-  upload(handle, renderer) {
-    if (handle.uploaded >= handle.tex.length) return true;
-    renderer.initTexture(handle.tex[handle.uploaded++]);
-    return handle.uploaded >= handle.tex.length;
+  /** Sends ≈ maxBytes more of handle's textures to the GPU (whole rows; default: up to the end of the next texture);
+      true once all of them are there. Call it over the frames ahead of a switch: no hitch at the switch. */
+  upload(handle, renderer, maxBytes) {
+    if (!handle || handle.remaining <= 0) return true;
+    handle.renderer = renderer;
+    const list = Object.values(handle.jobs);
+    if (maxBytes === undefined) {                                      // 0.3 behaviour: one texture per call
+      const j = list.find((x) => x.row < x.h);
+      maxBytes = j ? (j.h - j.row) * j.w * 16 : 0;
+    }
+    handle.remaining -= uploadJobs(renderer, list, maxBytes);
+    if (handle.remaining < 0) handle.remaining = 0;
+    return handle.remaining <= 0;
+  }
+
+  /** Once uploaded: the CPU arrays of the textures, handed over (e.g. transferred to a worker to be freed there). */
+  releaseData(handle) {
+    const out = [];
+    if (!handle || handle.remaining > 0) return out;
+    for (const j of Object.values(handle.jobs)) if (j.data) { out.push(j.data.buffer); j.data = null; }
+    return out;
   }
 
   useData(handle) {
     const u = this.material.uniforms;
     this.current = handle;
-    [u.uA.value, u.uB.value, u.uC.value, u.uD.value] = handle ? handle.tex : [null, null, null, null];
+    const J = handle ? handle.jobs : null;
+    [u.uA.value, u.uB.value, u.uC.value, u.uD.value] = J ? [J.A.tex, J.B.tex, J.C.tex, J.D.tex] : [null, null, null, null];
     u.uShScale.value = handle ? handle.shScale : 0;
     const tr = handle && handle.trigs;
     u.uTrigs.value = tr ? 1 : 0;
-    u.uE.value = tr ? handle.tex[4] : neutral().E;
-    u.uF.value = tr ? handle.tex[5] : handle && handle.shFull ? handle.tex[4] : neutral().F;
+    u.uE.value = tr ? J.E.tex : neutral().E;
+    u.uF.value = J && J.F ? J.F.tex : neutral().F;
     u.uTScale.value = tr ? tr.tScale : 1;
     u.uTCut.value = tr ? tr.cut : 0;
     u.uShDeg.value = tr ? tr.shDegree : handle && handle.shFull ? handle.shFull.shDegree : 0;
@@ -131,6 +155,9 @@ export class SplatMesh extends THREE.Mesh {
   /** Transitions between sequences: opacity weight of the sequence drawn (1 outside transitions). */
   setFade(opacity) { this.material.uniforms.uOpacity.value = opacity; }
 
+  /** Junction model of a crossfade: weights of its two sides (previous, next), opacity mixed at constant density. */
+  setSideWeights(w1, w2) { this.material.uniforms.uSideW.value.set(w1, w2); }
+
   raycast() {}                                          // splats are not pickable as a quad mesh
 
   setBox(mode, center, half, toScene) {
@@ -148,11 +175,17 @@ export class SplatMesh extends THREE.Mesh {
     this._inv.copy(this.matrixWorld).invert();
     u.uCamPos.value.setFromMatrixPosition(camera.matrixWorld).applyMatrix4(this._inv);
     if (this.onRender) this.onRender(renderer, camera);
+    if (this.current && this.current.remaining > 0) this.upload(this.current, renderer, Infinity);   // not sent ahead: now
   }
 
+  /** Frees the GPU textures of handle (kept in the renderer's reserve when there is one). */
   disposeData(handle) {
     if (!handle) return;
-    for (const t of handle.tex) t.dispose();
+    for (const j of Object.values(handle.jobs || {})) {
+      if (j.gl && handle.renderer) release(handle.renderer, j.gl);
+      j.gl = null; j.data = null;
+    }
+    handle.remaining = 0;
     if (this.current === handle) this.useData(null);
   }
 

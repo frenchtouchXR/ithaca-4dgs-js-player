@@ -19,11 +19,12 @@
 // Video time u (normalized over the whole video, u = frame / (total − 1)) → model time of a sequence starting at
 // frame `first`: t = (u (total − 1) − first) / fps_modele.
 
-import { decodeStreams } from "./ftgsz.js";
+import { decodeStreams, restUseful } from "./ftgsz.js";
 
 export const isTrgz = (buffer) => buffer.byteLength >= 8 && new TextDecoder().decode(new Uint8Array(buffer, 0, 8)) === "TRGSZ001";
 
-/** Decodes a .trgz (ArrayBuffer) into { trgz: header, fields, count, data (Float32Array, count × fields) }. */
+/** Decodes a .trgz (ArrayBuffer) into { trgz: header, fields, count, data (Float32Array, count × fields) }.
+    Colour streams above the SH degree drawn (the file's, or options.shDegreeMax in light mode) are skipped (0.4.0). */
 export async function decodeTrgz(buffer, options = {}) {
   const octets = new Uint8Array(buffer);
   if (!isTrgz(buffer)) throw new Error("Not a .trgz file (HD 4DGS, version 1).");
@@ -32,7 +33,8 @@ export async function decodeTrgz(buffer, options = {}) {
   if (h.format !== "trgz" || h.version !== 1) throw new Error(`HD 4DGS: format ${h.format} v${h.version} not supported`);
   const fields = [];
   for (const f of h.flux) for (const c of f.champs || []) if (!fields.includes(c)) fields.push(c);
-  return { trgz: h, ...(await decodeStreams(octets, h, 12 + lg, fields, options)) };
+  const deg = Math.min(3, h.sh_degree | 0, options.shDegreeMax >= 0 ? options.shDegreeMax : 3);
+  return { trgz: h, ...(await decodeStreams(octets, h, 12 + lg, fields, { ...options, useful: restUseful(h.sh_source | 0, deg) })) };
 }
 
 /** Centre of one gaussian at model time offset dt (s) from its central time → out[0..2]. m: motion row (anchor xyz,

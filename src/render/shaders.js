@@ -26,6 +26,7 @@ uniform highp sampler2D uE;   // HD 4DGS: anchor + σ (s), Bézier control point
 uniform usampler2D uF;        // SH degrees 1–3 as halves (6 texels per gaussian): HD 4DGS, or HD at degree 2–3
 uniform float uTScale, uTCut; // HD 4DGS: seconds of model time per unit of video time; soft temporal cut
 uniform int uShDeg;           // HD 4DGS: SH degree
+uniform vec2 uSideW;          // junction model of a crossfade (0.4.0): weights of its sides 1 and 2 (D.w bits 24–25)
 
 in float splatIndex;
 out vec4 vColor;
@@ -49,6 +50,8 @@ vec4 qmul(vec4 a, vec4 b) {   // quaternions (w, x, y, z)
 }
 
 float snorm8(uint u, uint s) { return (float((u >> s) & 255u) - 128.0) / 127.0; }
+// crossfade at constant density (0.4.0): the two sides together cover as one model; weight 0 hides, 1 keeps
+float sideFade(float a, float w) { return w >= 1.0 ? a : w <= 0.0 ? 0.0 : 1.0 - pow(max(1.0 - a, 0.0), w); }
 void cull() { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); vColor = vec4(0.0); vUv = vec2(0.0); }
 
 void main() {
@@ -61,6 +64,9 @@ void main() {
   float dt = uTime - a.w, xt = dt / vzd.y;
   uvec4 c = texelFetch(uC, uv, 0);
   vec2 szo = unpackHalf2x16(c.y);
+  uvec4 e = texelFetch(uD, uv, 0);
+  uint side = (e.w >> 24) & 3u;
+  float wSide = side == 1u ? uSideW.x : side == 2u ? uSideW.y : 1.0;
   float alpha;
   vec3 p;
   vec4 qs = vec4(1.0, 0.0, 0.0, 0.0);                     // HD 4DGS: rotation added by the motion (w, x, y, z)
@@ -69,7 +75,7 @@ void main() {
     float dts = dt * uTScale, sig = e0.w;
     float gm = exp(-0.5 * (dts / sig) * (dts / sig));
     if (uTCut > 0.0) gm = max((gm - uTCut) / (1.0 - uTCut), 0.0);
-    alpha = szo.y * gm * uOpacity;
+    alpha = sideFade(szo.y * gm * uOpacity, wSide);
     if (alpha < 1.0 / 255.0) { cull(); return; }
     // control points: P0 = (e1.xyz | e1.w e2.xy), P1 = (e2.zw e3.x | e3.yzw), P2 = (e4.xyz | e4.w e5.xy)
     float tau = clamp((dts + 2.0 * sig) / (4.0 * sig), 0.0, 1.0), b0 = (1.0 - tau) * (1.0 - tau), b1 = 2.0 * (1.0 - tau) * tau, b2 = tau * tau;
@@ -87,7 +93,7 @@ void main() {
     vec3 v = a.xyz - an, tq = 2.0 * cross(qs.yzw, v);
     p = v + qs.x * tq + cross(qs.yzw, tq) + an + pp;
   } else {
-    alpha = szo.y * exp(-0.5 * xt * xt) * uOpacity;
+    alpha = sideFade(szo.y * exp(-0.5 * xt * xt) * uOpacity, wSide);
     if (alpha < 1.0 / 255.0) { cull(); return; }
     p = a.xyz + vec3(vxy, vzd.x) * dt;
   }
@@ -143,8 +149,7 @@ void main() {
   vec2 ndc = center + (position.x * major + position.y * minor) * 2.0 / uViewport;
   gl_Position = vec4(ndc, clip.z / clip.w, 1.0);
 
-  // colour: SH degree 0 + 1
-  uvec4 e = texelFetch(uD, uv, 0);
+  // colour: SH degree 0 + 1 (texture D, fetched above)
   vec3 col = vec3(unpackHalf2x16(e.x), unpackHalf2x16(e.y & 65535u).x);
   if (uShScale > 0.0) {
     // SH bytes q0…q8 = R1 R2 R3 G1 G2 G3 B1 B2 B3: q0 q1 in e.y (bits 16, 24), q2…q5 in e.z, q6…q8 in e.w

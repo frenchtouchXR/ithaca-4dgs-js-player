@@ -48,8 +48,9 @@ function quat16(q) {
   return [(c[0] | (c[1] << 16)) >>> 0, (c[2] | (im << 16)) >>> 0];
 }
 
-/** Packs a decoded model ({ header, fields, count, data }) for the renderer. */
-export function packHD(model, { direct = false } = {}) {
+/** Packs a decoded model ({ header, fields, count, data }) for the renderer.
+    light (0.4.0, phones and headsets): colours limited to SH degree 1, in the compact layout of texture D (no texture F). */
+export function packHD(model, { direct = false, light = false } = {}) {
   // direct (converted Low Quality model): duration_lin, scale_lin_i are linear and win_0 / win_1 give the window explicitly
   const { comments } = parsePlyHeader(model.header);
   const { fields, count: n, data } = model, nf = fields.length;
@@ -68,7 +69,7 @@ export function packHD(model, { direct = false } = {}) {
   const sh = hasSH ? [0, 1, 2, K, K + 1, K + 2, 2 * K, 2 * K + 1, 2 * K + 2].map((k) => at["f_rest_" + k]) : [];
   // couleurs au-delà du degré 1 (livrables au degré 3 ou 2 distillé, 21/11/2026) : texture F (degrés 1–3 en demi-précision,
   // même rangement que le HD 4DGS) et le shader passe par la branche des couleurs complètes ; degré 1 : texture D comme avant
-  const shDegree = Math.min(3, Math.floor(Math.sqrt(K + 1)) - 1);
+  const shDegree = Math.min(light ? 1 : 3, Math.floor(Math.sqrt(K + 1)) - 1);
   const full = shDegree >= 2;
   const HF = full ? Math.max(1, Math.ceil((n * 6) / TEX_WIDTH)) : 0, F = full ? new Uint32Array(TEX_WIDTH * HF * 4) : null;
   const restF = [];                                          // champ de (coefficient k, canal c), k·3 + c
@@ -222,7 +223,7 @@ function quatFromMatrix(m) {
 }
 
 /** Low Quality sequence → the equivalent HD model, then the same packing. seq: { first, frames, total }. */
-export function packLQ(model, seq) {
+export function packLQ(model, seq, { light = false } = {}) {
   const { fields, count: n, data } = model, nf = fields.length;
   const at = Object.fromEntries(fields.map((f, i) => [f, i]));
   for (const f of ["x", "y", "z", "opacity", "t", "scale_t", "f_dc_0", "scale_0", "rot_0", "rot_r_0"])
@@ -259,7 +260,7 @@ export function packLQ(model, seq) {
   const flat = new Float32Array(out.length * F.length);
   out.forEach((row, i) => flat.set(row, i * F.length));
   return packHD({ header: `ply\ncomment n_frames ${N}\nend_header\n`, fields: F, count: out.length, data: flat },
-                        { direct: true });
+                        { direct: true, light });
 }
 
 // ── HD 4DGS (.trgz, format/trgz.js) ───────────────────────────────────────────────────────────────────────────────────
@@ -268,45 +269,63 @@ export function packLQ(model, seq) {
 //   E  RGBA32F   6 texels per gaussian: (anchor xyz, σ in s), then the three Bézier control points P0, P1, P2 (6 each)
 //   F  RGBA32UI  6 texels per gaussian: SH coefficients of degrees 1–3 as halves, coefficient k of channel c at k·3 + c
 // The motion is evaluated in the vertex shader (uTrigs) and, for the depth order, in the sort worker.
+// Light mode (0.4.0): colours limited to SH degree 1, stored in texture D as for the HD layout (no texture F).
 export const TRIGS_E = 6, TRIGS_F = 6;
 
 /** HD 4DGS sequence (decodeTrgz) → packed layout. seq: { first, frames, total } (place of the sequence in the video). */
-export function packTrigs(model, seq = {}) {
+export function packTrigs(model, seq = {}, { light = false } = {}) {
   const { trgz: hz, fields, count: n, data } = model, nf = fields.length;
   const at = Object.fromEntries(fields.map((f, i) => [f, i]));
-  const fps = Number(hz.fps_modele) || 30, cut = Number(hz.coupure) || 0, deg = Math.min(3, hz.sh_degree | 0), ks = hz.sh_source | 0;
+  const fps = Number(hz.fps_modele) || 30, cut = Number(hz.coupure) || 0, ks = hz.sh_source | 0;
+  const deg = Math.min(light ? 1 : 3, hz.sh_degree | 0), inD = light && deg >= 1;      // light: degree 1 in texture D
   const frames = seq.frames || hz.images || 2, first = seq.first || 0, total = Math.max(2, seq.total || first + frames);
   const tScale = (total - 1) / fps, u0 = first / (total - 1), dt = 1 / (total - 1);
   const H = Math.max(1, Math.ceil(n / TEX_WIDTH)), texels = TEX_WIDTH * H * 4;
-  const HE = Math.max(1, Math.ceil((n * TRIGS_E) / TEX_WIDTH)), HF = Math.max(1, Math.ceil((n * TRIGS_F) / TEX_WIDTH));
+  const HE = Math.max(1, Math.ceil((n * TRIGS_E) / TEX_WIDTH)), HF = inD ? 0 : Math.max(1, Math.ceil((n * TRIGS_F) / TEX_WIDTH));
   const A = new Float32Array(texels), B = new Uint32Array(texels), C = new Uint32Array(texels), D = new Uint32Array(texels);
-  const E = new Float32Array(TEX_WIDTH * HE * 4), F = new Uint32Array(TEX_WIDTH * HF * 4);
+  const E = new Float32Array(TEX_WIDTH * HE * 4), F = inD ? null : new Uint32Array(TEX_WIDTH * HF * 4);
   const sortPos = new Float32Array(n * 4), sortOpa = new Float32Array(n * 3), sortMot = new Float32Array(n * 22);
   const fw = new Float32Array([first * dt - 0.02 * dt, (first + frames - 1) * dt + 0.995 * dt]), uw = new Uint32Array(fw.buffer);
-  const g = (o, f) => data[o + at[f]];
   const nk = (deg + 1) ** 2 - 1;
   const rest = [];                                           // field index of (coefficient k, channel c)
   for (let k = 0; k < nk; k++) for (let c = 0; c < 3; c++) rest.push(at["f_rest_" + (c * ks + k)]);
+  // light: degree 1 as 9 bytes in texture D (R1 R2 R3 G1 G2 G3 B1 B2 B3, scaled by shScale), as packHD
+  const sh1 = inD ? [0, 1, 2, ks, ks + 1, ks + 2, 2 * ks, 2 * ks + 1, 2 * ks + 2].map((k) => at["f_rest_" + k]) : [];
+  let shScale = 0;
+  for (let i = 0; i < n && inD; i++) for (const c of sh1) shScale = Math.max(shScale, Math.abs(data[i * nf + c]));
+  shScale = shScale || 1;
+  // field offsets looked up once (0.4.0: by name for every gaussian before, ≈ 40 % of the packing time)
+  const [fx, fy, fz, fmu, fls, fop, fr0, fr1, fr2, fr3, fs0, fs1, fs2, fd0, fd1, fd2] =
+    ["x", "y", "z", "mu", "log_sigma", "opacity", "rot_0", "rot_1", "rot_2", "rot_3", "scale_0", "scale_1", "scale_2",
+     "f_dc_0", "f_dc_1", "f_dc_2"].map((f) => at[f]);
+  const fm = ["anchor_0", "anchor_1", "anchor_2"].map((f) => at[f]);
+  for (let c = 0; c < 3; c++) for (let j = 0; j < 6; j++) fm.push(at[`p${c}_${j}`]);
   for (let i = 0; i < n; i++) {
     const o = i * nf, p = i * 4;
-    const x = g(o, "x"), y = g(o, "y"), z = g(o, "z"), mu = u0 + g(o, "mu") / tScale, sig = Math.max(Math.exp(g(o, "log_sigma")), 1e-6);
-    const opacity = 1 / (1 + Math.exp(-g(o, "opacity")));
-    let qw = g(o, "rot_0"), qx = g(o, "rot_1"), qy = g(o, "rot_2"), qz = g(o, "rot_3");
+    const x = data[o + fx], y = data[o + fy], z = data[o + fz], mu = u0 + data[o + fmu] / tScale, sig = Math.max(Math.exp(data[o + fls]), 1e-6);
+    const opacity = 1 / (1 + Math.exp(-data[o + fop]));
+    let qw = data[o + fr0], qx = data[o + fr1], qy = data[o + fr2], qz = data[o + fr3];
     const ql = Math.hypot(qw, qx, qy, qz) || 1;
     qw /= ql; qx /= ql; qy /= ql; qz /= ql;
     A[p] = x; A[p + 1] = y; A[p + 2] = z; A[p + 3] = mu;
     B[p + 2] = uw[0]; B[p + 3] = uw[1];
-    C[p] = half2(Math.exp(g(o, "scale_0")), Math.exp(g(o, "scale_1")));
-    C[p + 1] = half2(Math.exp(g(o, "scale_2")), opacity);
+    C[p] = half2(Math.exp(data[o + fs0]), Math.exp(data[o + fs1]));
+    C[p + 1] = half2(Math.exp(data[o + fs2]), opacity);
     [C[p + 2], C[p + 3]] = quat16([qx, qy, qz, qw]);
-    D[p] = half2(0.5 + C0 * g(o, "f_dc_0"), 0.5 + C0 * g(o, "f_dc_1"));
-    D[p + 1] = toHalf(0.5 + C0 * g(o, "f_dc_2")) >>> 0;
-    const mrow = [g(o, "anchor_0"), g(o, "anchor_1"), g(o, "anchor_2"), sig];
-    for (let c = 0; c < 3; c++) for (let j = 0; j < 6; j++) mrow.push(g(o, `p${c}_${j}`));
-    E.set(mrow, i * TRIGS_E * 4);
-    sortMot.set(mrow, i * 22);
+    D[p] = half2(0.5 + C0 * data[o + fd0], 0.5 + C0 * data[o + fd1]);
+    D[p + 1] = toHalf(0.5 + C0 * data[o + fd2]) >>> 0;
+    if (inD) {
+      const q = sh1.map((c) => byte(data[o + c] / shScale));
+      D[p + 1] = (D[p + 1] | (q[0] << 16) | (q[1] << 24)) >>> 0;
+      D[p + 2] = (q[2] | (q[3] << 8) | (q[4] << 16) | (q[5] << 24)) >>> 0;
+      D[p + 3] = (q[6] | (q[7] << 8) | (q[8] << 16)) >>> 0;
+    }
+    const eo = i * TRIGS_E * 4, so = i * 22;
+    E[eo] = sortMot[so] = data[o + fm[0]]; E[eo + 1] = sortMot[so + 1] = data[o + fm[1]]; E[eo + 2] = sortMot[so + 2] = data[o + fm[2]];
+    E[eo + 3] = sortMot[so + 3] = sig;
+    for (let j = 3; j < 21; j++) E[eo + j + 1] = sortMot[so + j + 1] = data[o + fm[j]];
     const fo = i * TRIGS_F * 4;
-    for (let k = 0; k < rest.length; k += 2) F[fo + k / 2] = half2(data[o + rest[k]], k + 1 < rest.length ? data[o + rest[k + 1]] : 0);
+    if (F) for (let k = 0; k < rest.length; k += 2) F[fo + k / 2] = half2(data[o + rest[k]], k + 1 < rest.length ? data[o + rest[k + 1]] : 0);
     sortPos[p] = x; sortPos[p + 1] = y; sortPos[p + 2] = z; sortPos[p + 3] = mu;
     sortOpa[i * 3] = opacity; sortOpa[i * 3 + 1] = fw[0]; sortOpa[i * 3 + 2] = fw[1];
   }
@@ -319,9 +338,9 @@ export function packTrigs(model, seq = {}) {
     hi[a] = v[Math.ceil((m - 1) * 0.99)];
   }
   return {
-    count: n, width: TEX_WIDTH, height: H, shScale: 0, frames: total, window: null,
-    trigs: { tScale, cut, shDegree: deg, heightE: HE, heightF: HF },
-    textures: { A, B, C, D, E, F }, sort: { pos: sortPos, vel: new Float32Array(n * 4), opa: sortOpa, mot: sortMot,
+    count: n, width: TEX_WIDTH, height: H, shScale: inD ? shScale : 0, frames: total, window: null,
+    trigs: { tScale, cut, shDegree: inD ? 0 : deg, heightE: HE, heightF: HF },
+    textures: F ? { A, B, C, D, E, F } : { A, B, C, D, E }, sort: { pos: sortPos, vel: new Float32Array(n * 4), opa: sortOpa, mot: sortMot,
                                             trigs: { tScale, cut } }, bounds: { min: lo, max: hi },
   };
 }

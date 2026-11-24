@@ -10,15 +10,33 @@
 //
 // Events: "load" (index read), "ready" (first sequence on screen), "waiting" / "playing" (buffering), "ended",
 // "error" ({ error }), "progress" ({ loaded, total } sequences).
-// Speed first: decoding and sorting run in workers, the render loop never waits for them; the next sequence is
-// fetched, decoded, uploaded to the GPU (one texture per frame) and pre-sorted before it is needed.
+// Speed first: decoding and sorting run in workers, the render loop never waits for them; the sequences ahead are
+// fetched, decoded (several in parallel), uploaded to the GPU and pre-sorted before they are needed.
+// 0.4.0 (smooth playback, no frame over 25 ms at sequence changes on a desktop GPU):
+//   - a window of sequences ahead kept loaded (memory budget of the device), decoded by `decoders` workers in parallel;
+//   - GPU uploads by bands of rows within a byte budget per frame (≈ 4 ms, measured), earliest needed first; textures of
+//     released sequences reused on desktop (render/gpuTextures.js); finishing work spread one step per frame;
+//   - arrays already on the GPU released in the sort worker, not on the display thread;
+//   - crossfade of videos rendered with a transition: junction models (both sequences sorted as one, format/junction.js)
+//     prepared off the main thread (decode and junction workers, transfers without copies), weights continuous over the
+//     whole overlap at constant density, junction kept to the end of its overlap;
+//   - sound clock: time never goes back, output timestamp of the audio context when there is one, soft catch-up (±25 %)
+//     up to 1 s of drift; hard jump only at start, loop, pause / seek or beyond 1 s;
+//   - light mode (phones and headsets by default): colours up to SH degree 1, streams above neither decompressed nor decoded.
 import * as THREE from "three";
 import { SplatMesh } from "./render/SplatMesh.js";
 import { open4dgs, fetchRange, is4dgs } from "./format/container4dgs.js";
+import { packedBuffers, packedBytes } from "./format/junction.js";
+import { retainPool, releasePool, emptyReserve } from "./render/gpuTextures.js";
+import { isMobile, decoderCount, memoryBudgetMB } from "./device.js";
 import { ITHACA_SERVER, shareToken, resolveShare } from "./ithaca.js";
 
 const SOUND_ORDER = ["audio/mp4", "audio/mpeg", "audio/ogg", "audio/wav", "audio/aac"];
-const AHEAD_S = 1.0;            // the next sequence is uploaded and pre-sorted this long before its first frame
+const AHEAD_S = 1.0;            // the next sequence (or junction) is pre-sorted this long before its first frame
+const MB = 1e6;
+const PENDING_MAX = 1500 * MB;  // desktop: decoded data waiting for the GPU (beyond 2 decodes in parallel)
+const UPLOAD_TARGET_MS = 4;     // GPU upload per frame
+const auto = (v) => v === undefined || v === null || v === "auto";
 
 /** Browsers refuse a worker script from another origin (player loaded from a CDN): a same-origin stub (blob) then
     imports it, cross-origin module imports being allowed (with CORS, as CDNs serve them). */
@@ -36,8 +54,14 @@ function framingRotation([ax, ay, az]) {
 
 export class Ithaca4DGS extends THREE.Object3D {
   constructor({ src, autoplay = true, loop = true, listener = null, fps = 30, applyFraming = true, fetchFn,
-                server = ITHACA_SERVER, frames = null, format = null, crossfade = true } = {}) {
+                server = ITHACA_SERVER, frames = null, format = null, crossfade = "auto", light = "auto", decoders = "auto",
+                memoryBudgetMB: budget = "auto" } = {}) {
     super();
+    this._mobile = isMobile();
+    // light mode (phones, headsets): colours up to SH degree 1, no gaussian removed
+    this.light = auto(light) ? this._mobile : !!light;
+    this._budgetOption = auto(budget) ? null : Math.max(100, Number(budget) || 0);
+    this._decoderCount = auto(decoders) ? decoderCount(this._mobile) : Math.max(1, Math.floor(Number(decoders)) || 1);
     this.server = server;               // ITHACA site that resolves share links
     this.share = null;                  // description of the ITHACA share being played (share links only)
     this.type = "Ithaca4DGS";
@@ -46,7 +70,8 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.autoplay = autoplay;
     this.listener = listener;
     this.applyFraming = applyFraming;
-    this.crossfade = crossfade;         // transitions between sequences (videos rendered with them): crossfade, else cut
+    // transitions between sequences (videos rendered with them): crossfade, else cut; "auto": not in light mode
+    this.crossfade = auto(crossfade) ? !this.light : !!crossfade;
     this._zones = [];
     this.fps = fps;
     this.index = null;
@@ -58,7 +83,7 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.waiting = false;
     this._time = 0;
     this._fetch = fetchFn || ((...a) => fetch(...a));
-    this._entries = new Map();          // sequence k → { state, handle, promise }
+    this._entries = new Map();          // sequence k, or junction "j" + a → entry (state, handle, sort data…)
     this._active = -1;
     this._lastFrameId = -1;
     this._lastNow = 0;
@@ -66,9 +91,16 @@ export class Ithaca4DGS extends THREE.Object3D {
     this._req = 0;
     this._sorting = false;
     // timings (ms): last sort and decode in the workers, main-thread time of the last frame
-    this.stats = { sortMs: 0, sortsPerSecond: 0, decodeMs: 0, packMs: 0, fetchMs: 0, mainMs: 0, visible: 0, gaussians: 0 };
+    this.stats = { sortMs: 0, sortsPerSecond: 0, decodeMs: 0, packMs: 0, fetchMs: 0, mainMs: 0, visible: 0, gaussians: 0,
+                   uploadMB: 0, uploadMs: 0, forcedUploads: 0, hardSyncs: 0, softSyncFrames: 0, junctions: 0,
+                   decoders: this._decoderCount, capacity: 0, sequenceMB: 0, light: this.light };
     this._sortCount = 0;
     this._sortWindow = performance.now();
+    this._capacity = 0;                 // sequences kept loaded (memory budget), known once one is decoded
+    this._setIds = 1;                   // ids of the sort worker's sets
+    this._gen = 0;                      // generation of each decoded sequence (junction worker)
+    this._msPerMB = this._mobile ? 0.4 : 0.1;       // measured cost of the GPU upload (moving average)
+    this._frameDur = 1 / 60;
 
     // ITHACA renders are in the OpenCV frame (x right, y down, z forward); the framed scene has its floor at y = 0.
     // three.js is y up: a 180° rotation about Z (a true rotation, no mirror) stands the video up, its front towards +z
@@ -82,23 +114,19 @@ export class Ithaca4DGS extends THREE.Object3D {
     this.mesh = new SplatMesh();
     this.mesh.onRender = (renderer, camera) => this._onRender(renderer, camera);
     this.framing.add(this.mesh);
-    // second sequence drawn during a transition (crossfade), on top of the other when it is the fading one
+    // 0.3: second sequence drawn during a transition; 0.4.0: crossfades are junction models drawn by `mesh` (kept empty
+    // and hidden for code that referenced it)
     this.fadeMesh = new SplatMesh();
     this.fadeMesh.visible = false;
     this.framing.add(this.fadeMesh);
 
     // literal new Worker(new URL(…, import.meta.url)) forms: bundlers (Vite, webpack 5) bundle the workers from them
-    const dec = new URL("./workers/decode.worker.js", import.meta.url), srt = new URL("./workers/sort.worker.js", import.meta.url);
-    this._decoder = sameOrigin(dec) ? new Worker(new URL("./workers/decode.worker.js", import.meta.url), { type: "module" }) : stubWorker(dec);
+    const srt = new URL("./workers/sort.worker.js", import.meta.url);
     this._sorter = sameOrigin(srt) ? new Worker(new URL("./workers/sort.worker.js", import.meta.url), { type: "module" }) : stubWorker(srt);
+    this._decoders = [];                // pool of decode workers, opened on demand (up to _decoderCount)
+    this._junctions = null;             // junction worker (crossfade), opened on demand
     this._pending = new Map();
     this._nextId = 1;
-    this._decoder.onmessage = ({ data }) => {
-      const p = this._pending.get(data.id);
-      if (!p) return;
-      this._pending.delete(data.id);
-      data.error ? p.reject(new Error(data.error)) : p.resolve(data.packed);
-    };
     this._sorter.onmessage = ({ data }) => this._onSorted(data);
 
     // a load cancelled by dispose() (AbortError) is not an error of the video
@@ -203,12 +231,45 @@ export class Ithaca4DGS extends THREE.Object3D {
   }
 
   // ── sequences ───────────────────────────────────────────────────────────────────────────────────────────────
-  _decode(buffer, seq) {
-    const id = this._nextId++;
+  /** A decode worker of the pool: an idle one, else a new one up to `decoders`, else the least busy. */
+  _decoderWorker() {
+    let d = this._decoders.find((x) => !x.busy);
+    if (!d && this._decoders.length < this._decoderCount) {
+      const dec = new URL("./workers/decode.worker.js", import.meta.url);
+      const w = sameOrigin(dec) ? new Worker(new URL("./workers/decode.worker.js", import.meta.url), { type: "module" }) : stubWorker(dec);
+      d = { w, busy: 0 };
+      w.onmessage = ({ data }) => {
+        d.busy--;
+        const p = this._pending.get(data.id);
+        if (!p) return this._drop([data.packed, data.left, data.right]);
+        this._pending.delete(data.id);
+        data.error ? p.reject(new Error(data.error)) : p.resolve(data);
+      };
+      this._decoders.push(d);
+    }
+    if (!d) d = this._decoders.reduce((a, b) => (b.busy < a.busy ? b : a));
+    return d;
+  }
+
+  _decode(buffer, options) {
+    const id = this._nextId++, d = this._decoderWorker();
+    d.busy++;
     return new Promise((resolve, reject) => {
       this._pending.set(id, { resolve, reject });
-      this._decoder.postMessage({ id, buffer, seq }, [buffer]);
+      d.w.postMessage({ id, buffer, ...options }, [buffer]);
     });
+  }
+
+  /** Buffers released in the sort worker (transferred), off the display thread: packed models, sides, arrays. */
+  _drop(items) {
+    const bufs = new Set();
+    const add = (v) => { if (ArrayBuffer.isView(v)) v = v.buffer; if (v instanceof ArrayBuffer && v.byteLength > 0) bufs.add(v); };
+    for (const x of items) {
+      if (!x) continue;
+      if (x instanceof ArrayBuffer || ArrayBuffer.isView(x)) add(x);
+      else for (const b of packedBuffers(x)) add(b);
+    }
+    if (bufs.size) try { this._sorter.postMessage({ type: "drop" }, [...bufs]); } catch (e) { /* freed here then */ }
   }
 
   async _fetchSequence(s) {
@@ -233,17 +294,27 @@ export class Ithaca4DGS extends THREE.Object3D {
     if (k < 0 || k >= this.sequences.length) return Promise.resolve(null);
     let e = this._entries.get(k);
     if (e) return e.promise;
-    e = { state: "loading", handle: null, id: k + 1 };
+    e = { key: k, kind: "seq", state: "loading", downloading: true, handle: null, id: this._setIds++ };
     e.promise = (async () => {
       const tf = performance.now();
       const bytes = await this._fetchSequence(this.sequences[k]);
+      e.downloading = false;
       this.stats.fetchMs = performance.now() - tf;
+      if (this._entries.get(k) !== e) return null;    // evicted meanwhile
       const sq = this.sequences[k];
       // Low Quality needs the place of the sequence in the video (its time is local): known from the .4dgs index
       // HD 4DGS : temps du modèle compté depuis la première image d'ENTRAÎNEMENT (transition, 21/11/2026)
       const tr = sq.trainFrames > 0 && sq.trainFirst != null;
-      const packed = await this._decode(bytes, { first: tr ? sq.trainFirst : sq.first, frames: tr ? sq.trainFrames : sq.frames,
-                                                 total: this.totalFrames });
+      const zone = (a) => { const z = this._zones.find((x) => x.a === a); return z ? { a: z.a, start: z.start, end: z.end } : null; };
+      const left = zone(k - 1), right = zone(k);
+      // transitions: the window of every gaussian (its sequence's core) widened to the training frames (decode worker),
+      // and the sides of the junction models with the neighbours extracted there
+      const r = await this._decode(bytes, { seq: { first: tr ? sq.trainFirst : sq.first, frames: tr ? sq.trainFrames : sq.frames,
+                                                    total: this.totalFrames },
+                                            light: this.light, win: this._trainWindow(sq),
+                                            junctions: left || right ? { N: this.totalFrames, left, right } : null });
+      const packed = r.packed;
+      if (this._entries.get(k) !== e) { this._drop([packed, r.left, r.right]); return null; }
       this.stats.decodeMs = packed.ms.decode;
       this.stats.packMs = packed.ms.pack;
       const s = this.sequences[k];
@@ -255,33 +326,58 @@ export class Ithaca4DGS extends THREE.Object3D {
         this._range = [w.first, w.first + w.count];
         this._time = w.first / this.fps;
       }
-      if (this._entries.get(k) !== e) return null;    // evicted meanwhile
-      // transitions: the window of every gaussian (its sequence's core) widened to the training frames, in the GPU
-      // texture B (floats z, w) and in the sort data, so that the sequence stays drawn during its transitions
-      const win = this._trainWindow(s);
-      if (win) {
-        const B = packed.textures.B, opa = packed.sort.opa, f = new Float32Array(win), u = new Uint32Array(f.buffer);
-        for (let i = 0; i < packed.count; i++) {
-          B[i * 4 + 2] = u[0]; B[i * 4 + 3] = u[1];
-          opa[i * 3 + 1] = win[0]; opa[i * 3 + 2] = win[1];
-        }
-      }
       if (k === 0 || !this._framed) this._frame(packed.bounds);
-      const { pos, vel, opa, mot, trigs } = packed.sort;          // mot, trigs: HD 4DGS (.trgz) motion
-      this._sorter.postMessage({ type: "add", id: e.id, count: packed.count, pos, vel, opa, mot, trigs },
-                               [pos.buffer, vel.buffer, opa.buffer, ...(mot ? [mot.buffer] : [])]);
+      // memory of a loaded sequence: GPU textures and sort data, twice with transitions (junction models)
+      const one = packedBytes(packed), bytesSeq = one * (this._zones.length ? 2 : 1);
+      this._oneBytes = Math.max(this._oneBytes || 0, one);
+      this._seqBytes = Math.max(this._seqBytes || 0, bytesSeq);
+      this.stats.sequenceMB = Math.round(this._seqBytes / MB);
+      e.gen = ++this._gen;
+      if (r.left || r.right) this._sendSides(k, e.gen, r.left, r.right);
+      e.sort = packed.sort;
+      e.count = packed.count;
       e.handle = this.mesh.setData(packed);
-      e.state = "ready";
-      this.dispatchEvent({ type: "progress", loaded: [...this._entries.values()].filter((x) => x.state === "ready").length,
-                           total: this.sequences.length });
+      e.state = "upload";                             // on the GPU by bands over the next frames (_pump)
       return e;
     })().catch((error) => {
-      this._entries.delete(k);
+      if (this._entries.get(k) === e) this._entries.delete(k);
       if (error.name !== "AbortError") this._fail(error);
       return null;
     });
     this._entries.set(k, e);
     return e.promise;
+  }
+
+  // ── junction models (crossfade) ─────────────────────────────────────────────────────────────────────────────
+  _junctionWorker() {
+    if (this._junctions || !this._zones.length) return this._junctions;
+    try {
+      const jw = new URL("./workers/junction.worker.js", import.meta.url);
+      const w = sameOrigin(jw) ? new Worker(new URL("./workers/junction.worker.js", import.meta.url), { type: "module" }) : stubWorker(jw);
+      w.onmessage = ({ data }) => this._onJunction(data);
+      w.onerror = () => { w.terminate(); if (this._junctions === w) this._junctions = null; };   // hard cuts, nothing else
+      w.postMessage({ type: "config", N: this.totalFrames, zones: this._zones.map(({ a, start, end }) => ({ a, start, end })),
+                      seqs: this.sequences.map((s) => ({ trainFirst: s.trainFirst, trainFrames: s.trainFrames })) });
+      this._junctions = w;
+    } catch (e) { this._junctions = null; }
+    return this._junctions;
+  }
+
+  _sendSides(k, gen, left, right) {
+    const w = this._junctionWorker();
+    if (!w) return this._drop([left, right]);
+    const bufs = new Set([...(left ? packedBuffers(left) : []), ...(right ? packedBuffers(right) : [])]);
+    w.postMessage({ type: "sides", k, gen, left, right }, [...bufs]);
+  }
+
+  _onJunction(r) {
+    if (r.type !== "junction") return;               // "none": hard cut at this junction
+    const key = "j" + r.a, A = this._entries.get(r.a), B = this._entries.get(r.a + 1);
+    if (this._disposed || this._entries.has(key) || !A || !B || A.gen !== r.genA || B.gen !== r.genB) return this._drop([r.packed]);
+    const p = r.packed;
+    this._entries.set(key, { key, kind: "junction", a: r.a, state: "upload", id: this._setIds++, sort: p.sort, count: p.count,
+                             handle: this.mesh.setData(p) });
+    this.stats.junctions++;
   }
 
   /** Transitions (videos rendered with overlapping sequences, ITHACA « transition » setting): zone of each pair of
@@ -298,13 +394,6 @@ export class Ithaca4DGS extends THREE.Object3D {
 
   _zoneAt(f) { return this._zones.find((z) => f >= z.start && f <= z.end) || null; }
 
-  /** Opacity weights [previous, next] at frame f of a zone (same law as the ITHACA viewer): up to J the next sequence
-      fades in (1/(n+1) … n/(n+1)) over the full previous one; after J the previous one fades out over the full next. */
-  static _weights(z, f) {
-    const before = z.J - z.start + 1, after = z.end - z.J;
-    return f <= z.J ? [1, (f - z.start + 1) / (before + 1)] : [1 - (f - z.J) / (after + 1), 1];
-  }
-
   /** Time window of a sequence during transitions: its training frames (same margins as format/pack.js). */
   _trainWindow(s) {
     if (!this._zones.length || !(s.trainFrames > 0) || this.totalFrames < 2) return null;
@@ -315,10 +404,131 @@ export class Ithaca4DGS extends THREE.Object3D {
   _evict(keep) {
     for (const [k, e] of this._entries) {
       if (keep.has(k)) continue;
-      if (e.handle) { this.mesh.disposeData(e.handle); this.fadeMesh.disposeData(e.handle); }
-      this._sorter.postMessage({ type: "remove", id: e.id });
+      this._release(e);
       this._entries.delete(k);
     }
+  }
+
+  _release(e) {
+    if (e.handle) {
+      this._drop(this.mesh.releaseData(e.handle));
+      this._drop(Object.values(e.handle.jobs || {}).map((j) => j.data));     // upload not finished: freed off this thread
+      this.mesh.disposeData(e.handle);
+    }
+    if (e.sort) { this._drop(Object.values(e.sort)); e.sort = null; }
+    if (e.state === "ready") this._sorter.postMessage({ type: "remove", id: e.id });
+    if (e.kind === "seq" && e.gen) this._junctions?.postMessage({ type: "forget", k: e.key, gen: e.gen });
+    e.state = "released";
+  }
+
+  /** Window of sequences kept loaded from k on (in playing order, looping), the junctions between them, and the one being
+      played (kept to the end of its overlap even when its first sequence is gone); loads started in that order. */
+  _feed(k, frame) {
+    const n = this.sequences.length, cap = Math.max(1, this._capacity || 2), win = [];
+    for (let i = 0; i < Math.min(cap, n); i++) {
+      let j = k + i;
+      if (j >= n) { if (!this.loop) break; j %= n; }
+      if (!win.includes(j)) win.push(j);
+    }
+    const keep = new Set(win);
+    for (const z of this._zones) {
+      if (keep.has(z.a) && keep.has(z.a + 1)) keep.add("j" + z.a);
+      else if (keep.has(z.a + 1) && frame >= z.start && frame < z.end + 1) keep.add("j" + z.a);   // crossfade in progress
+    }
+    this._evict(keep);
+    // one download at a time (bandwidth to the earliest needed), up to `decoders` sequences being decoded; on desktop
+    // beyond 2, only while what waits for the GPU stays under PENDING_MAX
+    let loading = 0, downloading = false, pending = 0;
+    for (const e of this._entries.values()) {
+      if (e.state === "loading") { loading++; downloading ||= e.downloading; }
+      if (e.handle) pending += e.handle.remaining;
+    }
+    if (downloading || loading >= this._decoderCount) return;
+    if (!this._mobile && loading >= 2 && pending + (loading + 1) * (this._oneBytes || 0) > PENDING_MAX) return;
+    const next = win.find((j) => !this._entries.has(j));
+    if (next !== undefined) this._ensure(next);
+  }
+
+  /** Seconds of playback before entry e is needed (playing direction, looping); -1: now. */
+  _neededIn(e, k) {
+    if (e.key === k) return -1;
+    const z = e.kind === "junction" ? this._zones.find((x) => x.a === e.a) : null;
+    const start = (z ? z.start : this.sequences[e.key].first) / this.fps, d = Math.max(this.duration, 1e-3);
+    return ((((start - this._time) % d) + d) % d);
+  }
+
+  /** GPU uploads of the frame: bands of rows of the entries waiting for the GPU, earliest needed first, within a budget
+      set on the measured cost (≈ 4 ms; desktop 8 to 96 MB, phones 4 to 32 MB), raised up to 3 times when the next
+      needed one might not be ready 0.6 s before its turn (4 times before the start); then one finishing step per frame. */
+  _pump(renderer, k) {
+    const list = [];
+    for (const e of this._entries.values()) if (e.state === "upload" || e.state === "finish") list.push(e);
+    if (!list.length) return;
+    const when = new Map(list.map((e) => [e, this._neededIn(e, k)]));
+    list.sort((a, b) => when.get(a) - when.get(b));
+    const fin = list.find((e) => e.state === "finish");
+    if (fin) this._finishStep(fin, renderer);
+    const ups = list.filter((e) => e.state === "upload");
+    if (!ups.length) return;
+    const lo = (this._mobile ? 4 : 8) * MB, hi = (this._mobile ? 32 : 96) * MB;
+    const normal = Math.min(hi, Math.max(lo, (UPLOAD_TARGET_MS / Math.max(1e-3, this._msPerMB)) * MB));
+    let budget = this.ready ? normal : 4 * normal;
+    if (this.ready && this.playing) {
+      const frames = (when.get(ups[0]) - 0.6) / Math.max(1 / 120, this._frameDur);
+      budget = Math.min(3 * normal, Math.max(budget, ups[0].handle.remaining / Math.max(1, frames)));
+    }
+    const t0 = performance.now();
+    let done = 0;
+    for (const e of ups) {
+      if (done >= budget) break;
+      const before = e.handle.remaining;
+      if (this.mesh.upload(e.handle, renderer, budget - done)) { e.state = "finish"; e.steps = 0; }
+      done += before - e.handle.remaining;
+    }
+    const ms = performance.now() - t0;
+    this.stats.uploadMB += done / MB;
+    this.stats.uploadMs = ms;
+    if (done >= MB) this._msPerMB = 0.8 * this._msPerMB + 0.2 * Math.min(20, ms / (done / MB));
+  }
+
+  /** Finishing steps of an entry fully on the GPU, one per frame: memory check, then the sort worker (with the texture
+      arrays, released there). */
+  _finishStep(e, renderer) {
+    if (e.steps === 0) {
+      e.steps = 1;
+      const gl = renderer.getContext();
+      if (gl.getError() === gl.OUT_OF_MEMORY) {        // GPU full: this one dropped, window reduced to what is loaded
+        this._release(e);
+        this._entries.delete(e.key);
+        emptyReserve(renderer);
+        this._capacity = Math.max(2, [...this._entries.values()].filter((x) => x.kind === "seq" && x.state === "ready").length);
+        this.stats.capacity = this._capacity;
+      }
+      return;
+    }
+    const { pos, vel, opa, mot, trigs } = e.sort, drop = this.mesh.releaseData(e.handle);
+    this._sorter.postMessage({ type: "add", id: e.id, count: e.count, pos, vel, opa, mot, trigs, drop },
+                             [pos.buffer, vel.buffer, opa.buffer, ...(mot ? [mot.buffer] : []), ...drop]);
+    e.sort = null;
+    e.state = "ready";
+    if (e.kind === "seq")
+      this.dispatchEvent({ type: "progress", loaded: [...this._entries.values()].filter((x) => x.kind === "seq" && x.state === "ready").length,
+                           total: this.sequences.length });
+  }
+
+  /** Last resort: entry e needed now and not on the GPU yet: uploaded and finished at once (counted). */
+  _finishNow(e, renderer) {
+    if (e.state === "upload") { this.mesh.upload(e.handle, renderer, Infinity); e.state = "finish"; e.steps = 0; }
+    this.stats.forcedUploads++;
+    while (e.state === "finish") this._finishStep(e, renderer);
+  }
+
+  /** Device settings once the renderer is known: memory budget, sequences kept, texture reserve (desktop). */
+  _setupDevice(renderer) {
+    this._renderer0 = renderer;
+    this._budgetMB = this._budgetOption || memoryBudgetMB(renderer.getContext(), this._mobile);
+    // reserve of released textures: desktop only, at most 15 % of the budget (1 200 MB)
+    retainPool(renderer, this._mobile ? 0 : Math.min(1200, 0.15 * this._budgetMB) * MB);
   }
 
   /** Sequence shown at video position `frame` (continuous, in frames). The switch happens exactly where the windows
@@ -423,29 +633,31 @@ export class Ithaca4DGS extends THREE.Object3D {
     const now = performance.now();
     const dt = this._lastNow ? Math.min((now - this._lastNow) / 1000, 0.1) : 0;
     this._lastNow = now;
+    if (dt > 0) this._frameDur = 0.9 * this._frameDur + 0.1 * dt;
     if (!this.sequences.length || !this.totalFrames) return;
+    if (!this._renderer0) this._setupDevice(renderer);
+    if (!this._capacity && this._seqBytes && this._budgetMB) {
+      this._capacity = Math.max(2, Math.min(this.sequences.length, Math.floor((this._budgetMB * MB) / this._seqBytes)));
+      this.stats.capacity = this._capacity;
+    }
 
     const n = this.sequences.length;
     let frame = this._time * this.fps;
     let k = this._sequenceAt(frame);
+    const drawable = (f, kk) => {                      // something to draw at frame f: the junction or sequence kk
+      const z = this._zones.length ? this._zoneAt(Math.floor(f)) : null, J = z ? this._entries.get("j" + z.a) : null;
+      if (J && J.state === "ready" && J.order) return true;
+      const c = this._entries.get(kk);
+      return !!(c && c.state === "ready" && (c.order || !this.ready));
+    };
     const cur = this._entries.get(k);
-    const ok = cur && cur.state === "ready";
-    if (!ok) {
-      this._ensure(k);
+    if (this.ready && cur && (cur.state === "upload" || cur.state === "finish") && !drawable(frame, k)) this._finishNow(cur, renderer);
+    if (!drawable(frame, k)) {
       if (!this.waiting && this.ready) { this.waiting = true; this.dispatchEvent({ type: "waiting" }); }
     } else {
       if (this.waiting) { this.waiting = false; this.dispatchEvent({ type: "playing" }); }
       if (this.playing && (this.ready || this._active === k)) {
-        // clock: the sound track when it is playing (audio never re-seeked, the video follows it and skips frames on
-        // a slow device instead of drifting); otherwise the frame time
-        const s = this._sound, el = s && s.el;
-        // only a sound really heard is the clock: spatial sound (THREE.AudioListener) whose AudioContext is still
-        // suspended (no user gesture yet) keeps the element "playing" at a frozen time; the frame clock runs meanwhile
-        // and the sound is re-synced as soon as the context runs
-        const audible = !(s && s.node) || s.node.context.state === "running";
-        if (s && audible !== s.audible) { s.audible = audible; if (audible) this._syncSound(true); }
-        if (el && audible && !el.paused && !el.seeking && el.readyState >= 2 && !s.blocked) this._time = el.currentTime - s.offset;
-        else this._time += dt;
+        this._advance(dt, now);
         const t0 = this._range[0] / this.fps, t1 = this._range[1] / this.fps;
         if (this._time >= t1) {
           if (this.loop) { this._time = t0 + ((this._time - t0) % (t1 - t0)); this._syncSound(true); }
@@ -453,67 +665,60 @@ export class Ithaca4DGS extends THREE.Object3D {
         }
         frame = this._time * this.fps;
         k = this._sequenceAt(frame);
+        const nk = this._entries.get(k);
+        if (nk && (nk.state === "upload" || nk.state === "finish") && !drawable(frame, k)) this._finishNow(nk, renderer);
       }
     }
 
-    // keep the current and the next sequence; fetch / decode / upload / pre-sort the next ahead of time
-    const next = k + 1 < n ? k + 1 : this.loop && n > 1 ? 0 : -1;
-    // transition: inside the zone of two neighbour sequences both are drawn, each with its weight (frame begun)
+    // window of sequences ahead (fetch, decode, junctions), GPU uploads by bands
+    this._feed(k, frame);
+    this._pump(renderer, k);
+
+    // what is drawn: inside a crossfade overlap its junction model (both sequences, continuous weights), else sequence k
     const zone = this._zones.length ? this._zoneAt(Math.floor(frame)) : null;
-    const partner = zone ? (k === zone.a ? zone.a + 1 : zone.a) : -1;
-    this._evict(new Set([k, next, partner]));
-    this._ensure(k);
-    if (next >= 0) this._ensure(next);
-    if (partner >= 0) this._ensure(partner);
+    const J = zone ? this._entries.get("j" + zone.a) : null;
+    const useJ = !!(J && J.state === "ready" && J.order);
     const e = this._entries.get(k);
-    if (e && e.state === "ready") {
-      if (this._active !== k || this.mesh.current !== e.handle) {
-        this.mesh.upload(e.handle, renderer);
-        this.mesh.useData(e.handle);
-        this._active = k;
-      }
-      if (!this.ready && e.order) {
-        this.ready = true;
-        this.dispatchEvent({ type: "ready" });
-        if (this.autoplay && !this.playing) this.play();
-      }
+    const shown = useJ ? J : e && e.state === "ready" ? e : null;
+    if (shown && this.mesh.current !== shown.handle) {
+      this.mesh.useData(shown.handle);
+      this._active = k;
+    }
+    if (useJ) {
+      const s = Math.min(1, Math.max(0, (frame - zone.start) / Math.max(1, zone.end + 1 - zone.start)));
+      this.mesh.setSideWeights(1 - s, s);
+    } else this.mesh.setSideWeights(1, 1);
+    if (!this.ready && shown && shown.order) {
+      this.ready = true;
+      this.dispatchEvent({ type: "ready" });
+      if (this.autoplay && !this.playing) this.play();
     }
     const t = this._normalized(this._time);
     this.mesh.setTime(t);
+    this.mesh.setFade(1);
     this._syncSound(false);
+    if (this._sorting) return;
 
-    const pe = partner >= 0 ? this._entries.get(partner) : null;
-    const both = !!(zone && e && e.state === "ready" && pe && pe.state === "ready" && pe.order);
-    const [wPrev, wNext] = zone ? Ithaca4DGS._weights(zone, Math.floor(frame)) : [1, 1];
-    const wCur = !both ? 1 : k === zone.a ? wPrev : wNext, wPartner = k === zone?.a ? wNext : wPrev;
-    this.mesh.setFade(wCur);
-    this.mesh.renderOrder = wCur < 1 ? 1 : 0;           // the fading sequence is drawn over the full one
-    this.fadeMesh.visible = both;
-    if (both) {
-      if (this.fadeMesh.current !== pe.handle) { this.mesh.upload(pe.handle, renderer); this.fadeMesh.useData(pe.handle); }
-      this.fadeMesh.setTime(t);
-      this.fadeMesh.setFade(wPartner);
-      this.fadeMesh.renderOrder = wPartner < 1 ? 1 : 0;
-      // sort both sequences in turn, at the current time
-      if (!this._sorting) return (this._req & 1) ? this._sort(pe, t, camera, false) : this._sort(e, t, camera, false);
-      return;
+    // sort what is drawn; within AHEAD_S of what comes next (junction, or the next sequence), alternate with a pre-sort
+    // of it at its first frame
+    // (startUp: when it comes, in this loop; tUp: its own time then)
+    let up = null, startUp = 0, tUp = 0;
+    const next = k + 1 < n ? k + 1 : this.loop && n > 1 ? 0 : -1;
+    if (useJ) { up = this._entries.get(zone.a + 1); startUp = tUp = (zone.end + 1) / this.fps; }
+    else {
+      const zn = this._zones.find((z) => z.a === k && Math.floor(frame) < z.start), Jn = zn ? this._entries.get("j" + k) : null;
+      if (Jn && Jn.state === "ready") { up = Jn; startUp = tUp = zn.start / this.fps; }
+      else if (next > k) { up = this._entries.get(next); startUp = tUp = this.sequences[next].first / this.fps; }
+      else if (next === 0) { up = this._entries.get(0); startUp = this._range[1] / this.fps; tUp = this._range[0] / this.fps; }
     }
-
-    // sort: current sequence; within AHEAD_S of the next one, alternate with a pre-sort of the next at its start
-    const ne = next >= 0 ? this._entries.get(next) : null;
-    const sn = next >= 0 ? this.sequences[next] : null;
-    // with transitions the next sequence shows from the start of its zone
-    const startNext = sn ? (this._zones.length && next > 0 ? Math.min(sn.first, sn.trainFirst) : sn.first) / this.fps : 0;
-    const untilNext = next > k ? startNext - this._time : next === 0 ? this._range[1] / this.fps - this._time : Infinity;
-    if (ne && ne.state === "ready" && untilNext < AHEAD_S) {
-      this.mesh.upload(ne.handle, renderer);       // one texture per frame: no hitch at the switch
-      if (!this._sorting && (this._req & 1)) return this._sort(ne, this._normalized(startNext), camera, true);
-    }
-    if (!this._sorting && e && e.state === "ready") this._sort(e, t, camera, false);
-    else if (!this._sorting) this._req++;
+    const untilUp = up ? startUp - this._time : Infinity;
+    if (up && up !== shown && up.state === "ready" && untilUp < AHEAD_S && ((this._req & 1) || !shown))
+      return this._sort(up, this._normalized(tUp), camera);
+    if (shown) this._sort(shown, t, camera);
+    else this._req++;
   }
 
-  _sort(entry, t, camera, ahead) {
+  _sort(entry, t, camera) {
     const mv = this._mv || (this._mv = new THREE.Matrix4());
     mv.multiplyMatrices(camera.matrixWorldInverse, this.mesh.matrixWorld);
     const m = mv.elements;
@@ -533,12 +738,60 @@ export class Ithaca4DGS extends THREE.Object3D {
       this.stats.sortsPerSecond = (this._sortCount * 1000) / (now - this._sortWindow);
       this._sortCount = 0; this._sortWindow = now;
     }
-    for (const e of this._entries.values()) if (e.id === id && e.handle) {
+    for (const e of this._entries.values()) if (e.id === id && e.handle && e.state === "ready") {
       this.mesh.setOrder(e.handle, order, visible);
-      if (this.fadeMesh.current === e.handle) this.fadeMesh.setOrder(e.handle, order, visible);
       e.order = true;
       if (e.handle === this.mesh.current) { this.stats.visible = visible; this.stats.gaussians = e.handle.count; }
     }
+  }
+
+  /** Clock of the frame. The sound track, when it is heard, leads: the time follows the screen and catches up with the
+      sound softly (speed ±25 % at most, proportional to the drift) up to 1 s of drift; it jumps only at the start (play,
+      seek, loop, resume) or beyond 1 s; a frame more than 1 s ahead of the sound waits for it. It never goes back while
+      playing. Without a sound heard: the frame time. */
+  _advance(dt, now) {
+    const s = this._sound, el = s && s.el;
+    // only a sound really heard is the clock: spatial sound (THREE.AudioListener) whose AudioContext is still suspended
+    // (no user gesture yet) keeps the element "playing" at a frozen time; the frame clock runs meanwhile and the sound is
+    // re-synced as soon as the context runs
+    const audible = !(s && s.node) || s.node.context.state === "running";
+    if (s && audible !== s.audible) { s.audible = audible; if (audible) this._syncSound(true); }
+    if (!(el && audible && !el.paused && !el.seeking && el.readyState >= 2 && !s.blocked)) { this._time += dt; return; }
+    const target = this._heard(s, now) - s.offset, predicted = this._time + dt, e = target - predicted;
+    if (s.sync) {                                     // start, seek, loop, resume: on the sound (no step back when close)
+      this._time = Math.abs(target - this._time) > 0.5 ? target : Math.max(this._time, target);
+      s.sync = false;
+    } else if (e > 1) {                               // more than 1 s late: jump
+      this._time = Math.max(this._time, target);
+      this.stats.hardSyncs++;
+    } else if (e >= -1) {
+      const corr = Math.max(-0.25 * dt, Math.min(0.25 * dt, 0.08 * e));
+      if (Math.abs(corr) > 0.02 * dt) this.stats.softSyncFrames++;
+      this._time = Math.max(this._time, predicted + corr);
+    }                                                 // else: more than 1 s ahead, the frame waits for the sound
+  }
+
+  /** Position of the sound heard at `now` (s of the track). currentTime advances by packets on some browsers: prolonged
+      from its last change; with Web Audio (spatial sound), the output latency is removed, measured by the output
+      timestamp of the context (getOutputTimestamp) when it is usable, else outputLatency / baseLatency. */
+  _heard(s, now) {
+    const el = s.el, ct = el.currentTime;
+    if (ct !== s.lastCT) { s.lastCT = ct; s.lastNow = now; }
+    let p = ct + Math.min(Math.max(0, now - s.lastNow) / 1000, 0.25) * (el.playbackRate || 1);
+    const ctx = s.node && s.node.context;
+    if (ctx) {
+      let lat = null;
+      try {
+        const o = ctx.getOutputTimestamp && ctx.getOutputTimestamp();
+        if (o && o.performanceTime > 0 && o.contextTime > 0) {
+          const d = (now - o.performanceTime) / 1000;
+          if (d > -0.1 && d < 0.5) lat = ctx.currentTime - (o.contextTime + d);
+        }
+      } catch (e) { /* no output timestamp */ }
+      if (lat === null) lat = ctx.outputLatency || ctx.baseLatency || 0;
+      p -= Math.min(0.5, Math.max(0, lat));
+    }
+    return p;
   }
 
   // ── sound ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -595,10 +848,14 @@ export class Ithaca4DGS extends THREE.Object3D {
     if (!s) return;
     const target = s.offset + this._time;
     if (!this.playing || this.waiting) { if (!s.el.paused) s.el.pause(); return; }
-    // re-seek only on demand (play, seek, loop) or after a real desync (e.g. the sound ended before the video)
-    if (force || Math.abs(s.el.currentTime - target) > 0.25) s.el.currentTime = target;
+    // re-seek only on demand (play, seek, loop) or after a real desync (> 2 s: e.g. the sound ended before the video);
+    // otherwise the frame follows the sound (_advance)
+    if (force || Math.abs(s.el.currentTime - target) > 2) { s.el.currentTime = target; s.sync = true; }
     // autoplay policies: a blocked play() is retried only on play() / seek, not every frame
-    if (s.el.paused && (force || !s.blocked)) s.el.play().then(() => { s.blocked = false; }, () => { s.blocked = true; });
+    if (s.el.paused && (force || !s.blocked)) {
+      s.sync = true;
+      s.el.play().then(() => { s.blocked = false; }, () => { s.blocked = true; });
+    }
   }
 
   // ── end ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -608,11 +865,16 @@ export class Ithaca4DGS extends THREE.Object3D {
   }
 
   dispose() {
+    this._disposed = true;
     this._abort.abort();
     this.pause();
     this._evict(new Set());
-    this._decoder.terminate();
+    for (const d of this._decoders) d.w.terminate();
+    this._decoders = [];
+    this._junctions?.terminate();
+    this._junctions = null;
     this._sorter.terminate();
+    if (this._renderer0) releasePool(this._renderer0);
     this.mesh.dispose();
     this.fadeMesh.dispose();
     if (this._sound) { this._sound.el.src = ""; if (this._sound.node) this.remove(this._sound.node); }

@@ -1,6 +1,6 @@
 {
   "name": "ithaca-4dgs-js-player",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "ITHACA 4D Gaussian Splatting videos (.4dgs, .ftgsz, .trgz) as three.js / A-Frame objects for WebXR scenes and metaverses",
   "type": "module",
   "main": "src/index.js",
@@ -12,7 +12,8 @@
   "files": [
     "src",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "peerDependencies": {
     "three": ">=0.160.0"

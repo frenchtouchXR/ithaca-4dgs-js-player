@@ -19,10 +19,13 @@ on each video (`.4dgs` or `.ftgsz`, both read by this player), or play them dire
 - HD 4DGS (`.trgz`, since 0.3.0), HD and Low Quality ITHACA renders. HD 4DGS gaussians keep their own motion: a
   rigid screw motion (rotation + translation) whose rate follows a quadratic Bézier curve over each gaussian's life, so
   both their centre and their orientation change over time; colours up to spherical harmonics degree 3
-- Plays while loading: decoding and depth sorting run in Web Workers; the next sequence is fetched, decoded, uploaded
-  and pre-sorted before it is needed; the sound is the master clock
+- Plays while loading: decoding and depth sorting run in Web Workers; the sequences ahead are fetched, decoded (several
+  in parallel, as many as the device allows), sent to the GPU by small bands over the frames and pre-sorted before they
+  are needed — no long frame at sequence changes; the sound is the master clock, followed smoothly
 - Transitions: videos rendered with a transition between sequences (ITHACA expert setting) crossfade from one sequence
-  to the next; the others cut as before
+  to the next over the whole overlap, at constant density, both sequences sorted together; the others cut as before
+- Light mode on phones and headsets (automatic): colours up to spherical harmonics degree 1, less memory and faster
+  decoding, no gaussian removed
 - WebGL 2, three.js ≥ 0.160 (peer dependency), MIT licence, no other dependency
 
 ---
@@ -53,7 +56,7 @@ from your own server:
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
-    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.3.2/src/index.js"
+    "ithaca-4dgs-js-player": "https://cdn.jsdelivr.net/npm/ithaca-4dgs-js-player@0.4.0/src/index.js"
   }
 }
 </script>
@@ -180,7 +183,10 @@ playing it; `shareToken(url)` extracts the token of a share link; `shareUrl(toke
 | `fps` | `30` | frame rate when the source does not say |
 | `applyFraming` | `true` | apply the framing set on the ITHACA platform (`.4dgs`, share links) |
 | `frames` | `null` | frame count of a lone Low Quality sequence |
-| `crossfade` | `true` | crossfade between sequences in videos rendered with a transition (`false`: hard cut) |
+| `crossfade` | `"auto"` | crossfade between sequences in videos rendered with a transition (`false`: hard cut; `"auto"`: on, except in light mode; `true` forces it in light mode too) |
+| `light` | `"auto"` | light mode: colours up to SH degree 1 (degree-1 colours of HD 4DGS in the compact 8-bit layout of the Fast videos), less GPU memory, faster decoding; `"auto"`: on for phones, tablets and headsets (Meta Quest), off on computers |
+| `decoders` | `"auto"` | sequences decoded in parallel (Web Workers): computers one per 4 cores, 2 to 8 (bounded by the declared memory); phones 2 to 4 |
+| `memoryBudgetMB` | `"auto"` | memory granted to the sequences kept loaded ahead (GPU textures + sort data): computers with a dedicated GPU 8 000, Apple 4 000, others 3 000, phones 1 800 |
 | `format` | `null` | `"4dgs"`, `"manifest"`, `"ftgsz"`, `"trgz"` or `"ply"` when the name does not tell (a `Blob`) |
 | `server` | `"https://www.ithaca.eu"` | ITHACA site that resolves share links |
 | `fetchFn` | `fetch` | custom fetch (headers, credentials, signed URLs…) |
@@ -191,7 +197,10 @@ playing it; `shareToken(url)` extracts the token of a share link; `shareUrl(toke
 - `load(src, { frames, format })` — open a video
 - `share` — the share description when playing an ITHACA link (title, page URL…)
 - `boundingSphere()` — sphere of the video in world space (to place or frame it)
-- `stats` — worker timings (`sortMs`, `decodeMs`, …), visible and total gaussians
+- `stats` — worker timings (`sortMs`, `decodeMs`, `packMs`, …), visible and total gaussians; since 0.4.0 also
+  `uploadMB` (sent to the GPU), `forcedUploads` (sequences that had to be sent at once: should stay 0), `hardSyncs` /
+  `softSyncFrames` (sound clock), `junctions` (crossfade models built), `decoders`, `capacity` (sequences kept loaded),
+  `sequenceMB`, `light`
 - `dispose()` — frees the GPU memory, the workers and the sound
 
 ### Events (`addEventListener`)
@@ -213,7 +222,8 @@ playing it; `shareToken(url)` extracts the token of a share link; `shareUrl(toke
 </a-scene>
 ```
 
-Schema: `src`, `loop`, `autoplay`, `sound`, `frames`. The entity emits `ithaca-4dgs-ready`, `ithaca-4dgs-ended`, … (the
+Schema: `src`, `loop`, `autoplay`, `sound`, `frames`, `light`, `crossfade`, `decoders` (`auto`, `true` / `false`, or a
+number of decoders). The entity emits `ithaca-4dgs-ready`, `ithaca-4dgs-ended`, … (the
 events above, prefixed).
 
 ## Other exports
@@ -234,6 +244,12 @@ python3 test/perf.py <file.4dgs> <name>        # worker timings
 
 Test files are not included: download examples from the [Featured 4DGS gallery](https://www.ithaca.eu/featured-4dgs/)
 or use your own ITHACA renders (`test/data/`).
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md). **0.4.0**: smooth playback of long and heavy videos (no long frame at sequence
+changes), true crossfade at constant density, smooth sound clock, light mode on phones and headsets; new options
+`light`, `decoders`, `memoryBudgetMB`, `crossfade: "auto"`. No change needed in existing code.
 
 ## Licence
 

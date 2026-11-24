@@ -4,6 +4,9 @@
 // window, opacity ≥ 1/255, in front of the camera), 16-bit counting sort on view depth at t. Never blocks rendering:
 // the renderer keeps drawing with the last order received, for the next frames, while gaussians keep fading in;
 // those visible up to `ahead` later are therefore kept too (the shader still culls at the exact time).
+// 0.4.0: { type: "drop" } (or "add" with drop: [...]) hands over arrays already copied to the GPU only to be released
+// here, off the display thread (freeing ≈ 300 MB there took 20 to 50 ms: one missed screen frame); sort answers carry the
+// request number (req).
 import { screwCentre } from "../format/trgz.js";
 
 const sets = new Map();
@@ -16,6 +19,7 @@ self.onmessage = ({ data: m }) => {
     sets.set(m.id, { n, pos: m.pos, vel: m.vel, opa: m.opa, mot: m.mot || null, trigs: m.trigs || null,
                      depth: new Float32Array(n), vis: new Uint32Array(n), keys: null });
   } else if (m.type === "remove") sets.delete(m.id);
+  else if (m.type === "drop") { /* transferred buffers released with this message */ }
   else if (m.type === "sort") {
     const s = sets.get(m.id);
     if (!s) return;
